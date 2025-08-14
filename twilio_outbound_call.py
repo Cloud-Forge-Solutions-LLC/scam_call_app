@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Set
+from urllib.parse import urlparse
 
 from flask import (
     Flask,
@@ -314,6 +315,7 @@ _EDITABLE_ENV_KEYS = [
     "FLASK_PORT",
     "FLASK_DEBUG",
     "PUBLIC_BASE_URL",
+    "DIRECT_DIAL_ON_TRIGGER",
 ]
 
 _SECRET_ENV_KEYS = {
@@ -513,7 +515,7 @@ _CURRENT_CALL_SID: Optional[str] = None
 # Pending is used to block duplicate placements between calls.create and Twilio callbacks
 _PENDING_LOCK = threading.Lock()
 _PENDING_UNTIL_TS: Optional[float] = None
-_PENDING_TTL_SECONDS = 90.0  # safety window; auto-clears on /status initiated or /voice
+_PENDING_TTL_SECONDS = 30.0  # use short TTL during diagnostics
 
 
 def _set_current_call_sid(sid: Optional[str]) -> None:
@@ -633,7 +635,6 @@ def _should_record_call() -> bool:
     mode = (_runtime.recording_mode or "off").lower()
     if mode != "on":
         return False
-    # Honor configuration strictly; this app cannot infer consent states.
     if _runtime.recording_jurisdiction_mode == "disable_in_two_party":
         return False
     return True
@@ -664,6 +665,25 @@ def _compose_assistant_reply(call_sid: str, turn: int) -> List[str]:
     return _compose_followup_prompts(seed)
 
 
+def _public_url_warnings(url: Optional[str]) -> List[str]:
+    warnings: List[str] = []
+    if not url:
+        warnings.append("missing_public_base_url")
+        return warnings
+    try:
+        u = urlparse(url)
+        host = (u.hostname or "").lower()
+        if host in ("localhost", "127.0.0.1"):
+            warnings.append("public_base_url_is_localhost")
+        if host.startswith("192.168.") or host.startswith("10.") or host.startswith("172.16.") or host.startswith("172.17.") or host.startswith("172.18.") or host.startswith("172.19.") or host.startswith("172.2") or host.startswith("172.3"):
+            warnings.append("public_base_url_is_private_lan")
+        if not u.scheme or u.scheme not in ("http", "https"):
+            warnings.append("public_base_url_invalid_scheme")
+    except Exception:
+        warnings.append("public_base_url_parse_error")
+    return warnings
+
+
 def _diagnostics_ready_to_call() -> Tuple[bool, List[str]]:
     reasons: List[str] = []
     if not _runtime.to_number:
@@ -671,11 +691,14 @@ def _diagnostics_ready_to_call() -> Tuple[bool, List[str]]:
     from_n = _choose_from_number()
     if not from_n:
         reasons.append("missing_from_number")
-    if not _runtime.public_base_url:
-        reasons.append("missing_public_base_url")
     if _ensure_twilio_client() is None:
         reasons.append("twilio_client_not_initialized")
-    return (len(reasons) == 0), reasons
+    warnings = _public_url_warnings(_runtime.public_base_url)
+    if warnings:
+        reasons.extend(warnings)
+    # We are "ready" if only warnings exist (e.g., private URL), as we still want to test-call.
+    fatal = [r for r in reasons if r in ("missing_to_number", "missing_from_number", "twilio_client_not_initialized")]
+    return (len(fatal) == 0), reasons
 
 
 def _place_call_now() -> bool:
@@ -694,10 +717,16 @@ def _place_call_now() -> bool:
         log.error("Cannot place call: FROM_NUMBER or FROM_NUMBERS is not configured.")
         return False
     if not public_url:
-        log.error("Cannot place call: PUBLIC_BASE_URL is not set and USE_NGROK is disabled.")
+        log.error("Cannot place call: PUBLIC_BASE_URL is not set.")
         return False
 
+    # Warn loudly if URL appears private
+    url_warn = _public_url_warnings(public_url)
+    if url_warn:
+        log.warning("PUBLIC_BASE_URL warnings: %s (value=%s)", url_warn, public_url)
+
     try:
+        log.info("Preparing to place call (preflight). to=%s from=%s base=%s", _mask_phone(to_n), _mask_phone(from_n), public_url)
         _prepare_params_for_next_call()
         kwargs: Dict[str, Any] = dict(
             to=to_n,
@@ -715,10 +744,11 @@ def _place_call_now() -> bool:
                 "recording_status_callback_method": "POST",
             })
         log.info(
-            "Placing call: to=%s, from=%s, url=%s",
+            "Placing call via Twilio API. to=%s from=%s twiml_url=%s status_cb=%s",
             _mask_phone(kwargs["to"]),
             _mask_phone(kwargs["from_"]),
             kwargs["url"],
+            kwargs["status_callback"],
         )
         call = client.calls.create(**kwargs)  # type: ignore
         sid = getattr(call, "sid", "") or ""
@@ -766,6 +796,33 @@ def _reset_schedule_after_completion(now: int) -> None:
         )
 
 
+def _log_dialer_gates(label: str) -> Dict[str, Any]:
+    now_ts = int(time.time())
+    active_sid = _get_current_call_sid()
+    pending = _is_outgoing_pending()
+    within = _within_active_window(_now_local())
+    ready, reasons = _diagnostics_ready_to_call()
+    can_now, wait_s = (True, 0)
+    if _runtime.to_number:
+        can_now, wait_s = _can_attempt(now_ts, _runtime.to_number)
+    snapshot = dict(
+        label=label,
+        active_sid_set=bool(active_sid),
+        pending=pending,
+        within_active_window=within,
+        ready=ready,
+        reasons=reasons,
+        can_attempt=can_now,
+        wait_if_capped=wait_s,
+        to=_mask_phone(_runtime.to_number),
+        from_single=_mask_phone(_runtime.from_number),
+        from_pool_count=len(_runtime.from_numbers or []),
+        public_url_set=bool(_runtime.public_base_url),
+    )
+    log.info("Dialer gates [%s]: %s", label, snapshot)
+    return snapshot
+
+
 def _dialer_loop() -> None:
     log.info("Dialer thread started.")
     while not _stop_requested.is_set():
@@ -773,23 +830,26 @@ def _dialer_loop() -> None:
             now = int(time.time())
             _initialize_schedule_if_needed(now)
 
-            # Manual request
+            # Manual request (from /api/call-now if not direct-dial)
             if _manual_call_requested.is_set():
                 _manual_call_requested.clear()
-                log.info("Manual call request received.")
-                ready, reasons = _diagnostics_ready_to_call()
-                if not ready:
-                    log.error("Manual call suppressed; not ready: %s", reasons)
+                log.info("Manual call request received by dialer.")
+                gates = _log_dialer_gates("manual")
+                if not gates["ready"]:
+                    log.error("Manual call suppressed; not ready: %s", gates["reasons"])
                 else:
-                    if (_get_current_call_sid() is None) and _within_active_window(_now_local()):
-                        can, wait_s = _can_attempt(now, _runtime.to_number)
-                        if can:
+                    if (not gates["active_sid_set"]) and gates["within_active_window"]:
+                        if gates["can_attempt"]:
+                            log.info("Manual dialer path proceeding to place call now.")
                             ok = _place_call_now()
+                            log.info("Manual dialer path place_call_now result=%s", ok)
                             if not ok:
                                 log.error("Manual call attempt failed. Rescheduling.")
                                 _reset_schedule_after_completion(now)
                         else:
-                            log.info("Manual attempt blocked by caps; wait %s seconds.", wait_s)
+                            log.info("Manual attempt blocked by caps; wait %s seconds.", gates["wait_if_capped"])
+                    else:
+                        log.info("Manual attempt suppressed; active_sid=%s within_window=%s", gates["active_sid_set"], gates["within_active_window"])
 
             # Automatic schedule-based attempt
             with _next_call_epoch_s_lock:
@@ -798,26 +858,29 @@ def _dialer_loop() -> None:
 
             if ready_time:
                 log.info("Schedule window reached. seconds_until_next=%s", seconds_until)
-                diag_ready, diag_reasons = _diagnostics_ready_to_call()
-                if not diag_ready:
-                    log.error("Scheduled attempt suppressed; not ready: %s", diag_reasons)
+                gates = _log_dialer_gates("scheduled")
+                if not gates["ready"]:
+                    log.error("Scheduled attempt suppressed; not ready: %s", gates["reasons"])
                     _reset_schedule_after_completion(now)
-                elif _is_outgoing_pending():
+                elif gates["pending"]:
                     log.info("Scheduled attempt suppressed; reason=outgoing_pending")
-                elif _get_current_call_sid() is not None:
+                    _reset_schedule_after_completion(now)  # do not tight-loop on pending
+                elif gates["active_sid_set"]:
                     log.info("Scheduled attempt suppressed; reason=current_call_in_progress sid=%s", _mask_sid(_get_current_call_sid()))
-                elif not _within_active_window(_now_local()):
+                    _reset_schedule_after_completion(now)
+                elif not gates["within_active_window"]:
                     log.info("Scheduled attempt suppressed; reason=outside_active_window")
                     _reset_schedule_after_completion(now)
                 else:
-                    can, _ = _can_attempt(now, _runtime.to_number)
-                    if can:
+                    if gates["can_attempt"]:
+                        log.info("Scheduled dialer proceeding to place call now.")
                         ok = _place_call_now()
+                        log.info("Scheduled dialer place_call_now result=%s", ok)
                         if not ok:
                             log.error("Scheduled call attempt failed. Rescheduling.")
                             _reset_schedule_after_completion(now)
                     else:
-                        log.info("Scheduled attempt blocked by caps; rescheduling.")
+                        log.info("Scheduled attempt blocked by caps; rescheduling. wait=%s", gates["wait_if_capped"])
                         _reset_schedule_after_completion(now)
 
             # Sleep in short steps for responsiveness on shutdown
@@ -930,7 +993,7 @@ def _log_runtime_summary(context: str = "startup") -> None:
     log.info(
         "Runtime summary (%s): to=%s, from_single=%s, from_pool=%s, public_url_set=%s, "
         "active_hours=%s on %s, interval=%ss..%ss, caps(hour/day)=%s/%s, rotate_prompts=%s, "
-        "media_streams=%s, use_ngrok=%s, ready_to_call=%s, not_ready_reasons=%s",
+        "media_streams=%s, use_ngrok=%s, ready_to_call=%s, reasons=%s",
         context,
         _mask_phone(_runtime.to_number),
         _mask_phone(_runtime.from_number),
@@ -1068,7 +1131,7 @@ def api_status():
         interval_start = _interval_start_epoch_s
         interval_total = _interval_total_seconds
 
-    _ = _is_outgoing_pending()  # maintained for internal checks
+    pend = _is_outgoing_pending()
     active_sid = _get_current_call_sid()
     call_in_progress = bool(active_sid)
 
@@ -1115,12 +1178,16 @@ def api_status():
         "from_number": _runtime.from_number,
         "from_numbers": _runtime.from_numbers,
         "call_in_progress": call_in_progress,
+        "outgoing_pending": pend,
         "media_streams_enabled": bool(_runtime.enable_media_streams),
         "public_base_url": _runtime.public_base_url or "",
         "ready_to_call": ready,
         "not_ready_reasons": reasons,
     }
-    log.debug("GET /api/status -> in_progress=%s, seconds_until_next=%s, ready=%s, reasons=%s", call_in_progress, seconds_until_next, ready, reasons)
+    log.debug(
+        "GET /api/status -> in_progress=%s, seconds_until_next=%s, pending=%s, ready=%s, reasons=%s",
+        call_in_progress, seconds_until_next, pend, ready, reasons
+    )
     return jsonify(payload)
 
 
@@ -1210,6 +1277,41 @@ def api_next_greeting():
         _ONE_SHOT_GREETING = phrase
     log.info("POST /api/next-greeting accepted: words=%s, len=%s", len(words), len(phrase))
     return jsonify(ok=True)
+
+
+@app.route("/api/diag/state", methods=["GET"])
+def api_diag_state():
+    # Expose a concise snapshot for troubleshooting
+    now_ts = int(time.time())
+    pend = _is_outgoing_pending()
+    active_sid = _get_current_call_sid()
+    ready, reasons = _diagnostics_ready_to_call()
+    can_now, wait_s = (True, 0)
+    if _runtime.to_number:
+        can_now, wait_s = _can_attempt(now_ts, _runtime.to_number)
+    with _next_call_epoch_s_lock:
+        next_epoch = _next_call_epoch_s
+        interval_total = _interval_total_seconds
+        interval_start = _interval_start_epoch_s
+    payload = {
+        "active_sid": active_sid,
+        "pending": pend,
+        "ready": ready,
+        "reasons": reasons,
+        "can_attempt": can_now,
+        "wait_if_capped": wait_s,
+        "to": _runtime.to_number,
+        "from": _runtime.from_number,
+        "from_pool": _runtime.from_numbers,
+        "public_base_url": _runtime.public_base_url,
+        "active_hours_local": _runtime.active_hours_local,
+        "active_days": _runtime.active_days,
+        "next_call_epoch": next_epoch,
+        "interval_total": interval_total,
+        "interval_start": interval_start,
+    }
+    log.info("GET /api/diag/state -> %s", {**payload, "to": _mask_phone(payload["to"]), "from": _mask_phone(payload["from"])})
+    return jsonify(payload)
 
 
 def _build_opening_lines_for_sid(call_sid: str) -> List[str]:
@@ -1619,31 +1721,58 @@ def api_call_now():
     if not ready:
         log.error("Call-now rejected; not ready: %s", reasons)
         return jsonify(ok=False, reason="not_ready", message="Service not ready for outbound calls.", reasons=reasons), 400
+
+    # Optional direct dial path to eliminate timing/race issues during diagnostics
+    direct = _parse_bool(os.environ.get("DIRECT_DIAL_ON_TRIGGER"), True)
+
     if not _within_active_window(_now_local()):
-        log.info("Call-now outside active window.")
-        return jsonify(ok=False, reason="outside_active_window", message="Outside active calling window."), 200
+        msg = "Outside active calling window."
+        log.info("Call-now inside=%s -> %s", False, msg)
+        return jsonify(ok=False, reason="outside_active_window", message=msg), 200
     if not _runtime.to_number:
         log.info("Call-now missing destination TO_NUMBER.")
         return jsonify(ok=False, reason="missing_destination", message="TO_NUMBER is not configured."), 400
-    now = int(time.time())
-    allowed, wait_s = _can_attempt(now, _runtime.to_number)
-    if not allowed:
-        log.info("Call-now capped; wait %s seconds.", wait_s)
-        return jsonify(ok=False, reason="cap_reached", wait_seconds=wait_s), 429
+
     if _get_current_call_sid() is not None:
         log.info("Call-now suppressed; call already in progress.")
         return jsonify(ok=False, reason="already_in_progress", message="A call is already in progress."), 409
     if _is_outgoing_pending():
         log.info("Call-now suppressed; outgoing pending in effect.")
         return jsonify(ok=False, reason="pending", message="A call request is already pending."), 409
+
+    now = int(time.time())
+    allowed, wait_s = _can_attempt(now, _runtime.to_number)
+    if not allowed:
+        log.info("Call-now capped; wait %s seconds.", wait_s)
+        return jsonify(ok=False, reason="cap_reached", wait_seconds=wait_s), 429
+
+    if direct:
+        log.info("Call-now taking direct path (DIRECT_DIAL_ON_TRIGGER=true).")
+        gates = _log_dialer_gates("direct_call_now")
+        ok = _place_call_now()
+        log.info("Direct call-now place_call_now result=%s", ok)
+        if ok:
+            return jsonify(ok=True, started=True)
+        return jsonify(ok=False, reason="twilio_error", message="Twilio call placement failed; see server logs."), 502
+
+    # Fallback to dialer-thread path
     _mark_outgoing_pending()
     _manual_call_requested.set()
     log.info("Call-now accepted; manual request queued.")
-    return jsonify(ok=True)
+    return jsonify(ok=True, queued=True)
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify(ok=True, ts=int(time.time()))
 
 
 def main():
     log.info("Scam Call Console starting.")
+    # Log masked account SID if present
+    acc = os.environ.get("TWILIO_ACCOUNT_SID", "")
+    if acc:
+        log.info("Twilio Account SID present (masked): %s", _mask_sid(acc))
     _log_runtime_summary(context="startup")
     _start_ngrok_if_enabled()
     _start_background_threads()
