@@ -341,6 +341,15 @@
 
     const parts = [];
 
+    // Show last placement error if recent (within 10 minutes)
+    const err = data.last_error;
+    if (err && err.message) {
+      const age = Date.now() / 1000 - (err.ts || 0);
+      if (age < 600) {
+        parts.push(`<div class="alert">Last error: ${escapeHtml(err.message)}</div>`);
+      }
+    }
+
     // Active window chip
     if (data.within_active_window) {
       parts.push(`<div class="chip" style="display:inline-flex;align-items:center;gap:.5rem;padding:.35rem .6rem;border:1px solid var(--border);border-radius:999px;background:rgba(0,0,0,.2);">
