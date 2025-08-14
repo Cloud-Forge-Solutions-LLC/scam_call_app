@@ -3,21 +3,13 @@
 Scam Call Console: Outbound caller service with admin UI, pacing, Twilio voice,
 optional Media Streams, live transcript API, history APIs, and clean shutdown.
 
-Updates in this version:
-- Continuous conversation: after greeting, the caller and callee can exchange multiple turns
-  (configurable via MAX_DIALOG_TURNS) until silence or limit.
-- Graceful termination: Ctrl+C (SIGINT) and SIGTERM stop the server and background threads cleanly.
-- Wait-to-speak: Wait for the callee to speak first before the assistant starts talking.
-- Alternating voice per call: Switches assistant TTS voice between male and female every other call.
-- Rotating dialog: Each call uses a different dialog set (will cycle through the list).
-- Recording plumbing: Optional call recording via Twilio; adds recording status callback and
-  a proxy endpoint to stream recordings if enabled (configure legally and responsibly).
-- Call history: Persist call metadata and transcript to disk, and provide /api/history endpoints.
-- UI accuracy: Status/live endpoints report "in progress" only when a real CallSid is active.
+Diagnostic build: adds comprehensive logging for call placement, scheduling,
+request handling, Twilio callbacks, env updates, and live audio streaming.
 
 Notes:
-- Comply with all applicable laws (especially call recording).
-- Do not include real secrets in source control; use a private .env locally.
+- Do not store real secrets in source control; keep .env private.
+- Phone numbers and SIDs are masked in logs to reduce exposure.
+- All logs go to stdout using Python logging.
 """
 
 from __future__ import annotations
@@ -47,8 +39,8 @@ from flask import (
     request,
     session,
     url_for,
-    send_file,
 )
+
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 # Optional bcrypt for admin auth
@@ -90,16 +82,38 @@ try:
 except Exception:
     IV_PROMPTS = []  # type: ignore
 
+
+# ---------- Logging setup ----------
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s %(levelname)s [%(threadName)s] %(name)s:%(lineno)d %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger("scam_call_console")
+
+
+def _mask_phone(val: Optional[str]) -> str:
+    s = (val or "").strip()
+    if not s:
+        return ""
+    digits = "".join(ch for ch in s if ch.isdigit() or ch == "+")
+    if len(digits) <= 4:
+        return f"...{digits}"
+    return f"...{digits[-4:]}"
+
+
+def _mask_sid(sid: Optional[str]) -> str:
+    s = (sid or "").strip()
+    if len(s) <= 6:
+        return s
+    return f"{s[:4]}...{s[-4:]}"
+
+
 app = Flask(__name__, static_folder="static", template_folder="templates")
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_host=1)  # type: ignore
 app.secret_key = os.environ.get("FLASK_SECRET", os.urandom(32))
 
-# Logging setup
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
 
 TRUE_SET = {"1", "true", "yes", "on", "y", "t"}
 
@@ -149,7 +163,7 @@ def _load_dotenv_pairs(path: str) -> List[Tuple[str, str]]:
                 val = val[1:-1]
             pairs.append((key, val))
     except Exception as e:
-        logging.error("Failed to read .env pairs: %s", e)
+        log.error("Failed to read .env pairs: %s", e)
     return pairs
 
 
@@ -380,16 +394,19 @@ def _write_env_updates_preserving_comments(updates: Dict[str, str]) -> None:
         except Exception:
             pass
         os.replace(tmp, env_path)
+        log.info("Wrote .env updates for keys: %s", ", ".join(sorted(updates.keys())))
     except Exception as e:
-        logging.error("Failed writing .env: %s", e)
+        log.error("Failed writing .env: %s", e)
 
 
 def _apply_env_updates(updates: Dict[str, str]) -> None:
+    log.info("Applying env updates: %s", {k: ("<redacted>" if k in _SECRET_ENV_KEYS else updates[k]) for k in updates})
     _write_env_updates_preserving_comments(updates)
     for k, v in updates.items():
         if k in _EDITABLE_ENV_KEYS and k not in _SECRET_ENV_KEYS:
             os.environ[k] = "" if v is None else str(v)
     _load_runtime_from_env()
+    _log_runtime_summary(context="after env update")
 
 
 # Attempt pacing
@@ -411,6 +428,7 @@ def _prune_attempts(now_ts: int, to_number: str) -> None:
 def _note_attempt(now_ts: float, to_number: str) -> None:
     with _attempts_lock:
         _dest_attempts.setdefault(to_number, []).append(now_ts)
+    log.info("Noted attempt at %s for %s", int(now_ts), _mask_phone(to_number))
 
 
 def _within_active_window(now_local: datetime) -> bool:
@@ -439,8 +457,11 @@ def _can_attempt(now_ts: int, to_number: str) -> Tuple[bool, int]:
         last_hour = [t for t in lst if t >= now_ts - 3600]
         if len(last_hour) >= _runtime.hourly_max_attempts:
             oldest = min(last_hour) if last_hour else now_ts
-            return False, max(1, (int(oldest) + 3600) - now_ts)
+            wait = max(1, (int(oldest) + 3600) - now_ts)
+            log.info("Attempt blocked by hourly cap: %s/%s, wait %ss", len(last_hour), _runtime.hourly_max_attempts, wait)
+            return False, wait
         if len(lst) >= _runtime.daily_max_attempts:
+            log.info("Attempt blocked by daily cap: %s/%s", len(lst), _runtime.daily_max_attempts)
             return False, 3600
     return True, 0
 
@@ -462,14 +483,15 @@ def _ensure_twilio_client() -> Optional[Client]:
     if _twilio_client is not None:
         return _twilio_client
     if Client is None:
-        logging.error("Twilio SDK not available. Install with: pip install twilio")
+        log.error("Twilio SDK not available. Install with: pip install twilio")
         return None
     sid = os.environ.get("TWILIO_ACCOUNT_SID")
     tok = os.environ.get("TWILIO_AUTH_TOKEN")
     if not sid or not tok:
-        logging.error("Missing TWILIO_ACCOUNT_SID or TWILIO_AUTH_TOKEN in environment.")
+        log.error("Missing TWILIO_ACCOUNT_SID or TWILIO_AUTH_TOKEN in environment.")
         return None
     _twilio_client = Client(sid, tok)
+    log.info("Twilio client initialized (account SID present).")
     return _twilio_client
 
 
@@ -498,6 +520,7 @@ def _set_current_call_sid(sid: Optional[str]) -> None:
     global _CURRENT_CALL_SID
     with _CURRENT_CALL_LOCK:
         _CURRENT_CALL_SID = sid
+    log.info("Set current call SID to %s", _mask_sid(sid))
 
 
 def _get_current_call_sid() -> Optional[str]:
@@ -509,12 +532,14 @@ def _mark_outgoing_pending() -> None:
     global _PENDING_UNTIL_TS
     with _PENDING_LOCK:
         _PENDING_UNTIL_TS = time.time() + _PENDING_TTL_SECONDS
+    log.info("Marked outgoing call as pending for %.0fs", _PENDING_TTL_SECONDS)
 
 
 def _clear_outgoing_pending() -> None:
     global _PENDING_UNTIL_TS
     with _PENDING_LOCK:
         _PENDING_UNTIL_TS = None
+    log.info("Cleared outgoing pending flag.")
 
 
 def _is_outgoing_pending() -> bool:
@@ -524,12 +549,17 @@ def _is_outgoing_pending() -> bool:
             return False
         if time.time() >= _PENDING_UNTIL_TS:
             _PENDING_UNTIL_TS = None
+            log.info("Pending flag expired.")
             return False
         return True
 
 
-def _is_call_busy() -> bool:
-    return (_get_current_call_sid() is not None) or _is_outgoing_pending()
+def _busy_reason() -> Optional[str]:
+    if _get_current_call_sid() is not None:
+        return "current_call_sid_set"
+    if _is_outgoing_pending():
+        return "outgoing_pending"
+    return None
 
 
 # Dialog rotation and per-call parameters
@@ -562,6 +592,7 @@ def _select_next_call_params() -> CallParams:
         _PLACED_CALL_COUNT += 1
         voice = "man" if (_PLACED_CALL_COUNT % 2 == 1) else "woman"
         _LAST_DIALOG_IDX = (_LAST_DIALOG_IDX + 1) % max(1, len(_DIALOGS))
+        log.info("Selected call params: voice=%s, dialog_idx=%s", voice, _LAST_DIALOG_IDX)
         return CallParams(voice=voice, dialog_idx=_LAST_DIALOG_IDX)
 
 
@@ -569,6 +600,7 @@ def _prepare_params_for_next_call() -> None:
     global _PENDING_CALL_PARAMS
     with _PARAMS_LOCK:
         _PENDING_CALL_PARAMS = _select_next_call_params()
+    log.info("Prepared params for next call: %s", _PENDING_CALL_PARAMS)
 
 
 def _assign_params_to_sid(sid: str) -> None:
@@ -579,6 +611,7 @@ def _assign_params_to_sid(sid: str) -> None:
         if _PENDING_CALL_PARAMS is None:
             _PENDING_CALL_PARAMS = _select_next_call_params()
         _CALL_PARAMS_BY_SID[sid] = _PENDING_CALL_PARAMS
+        log.info("Assigned params to SID %s: %s", _mask_sid(sid), _PENDING_CALL_PARAMS)
         _PENDING_CALL_PARAMS = None
 
 
@@ -600,34 +633,28 @@ def _should_record_call() -> bool:
     mode = (_runtime.recording_mode or "off").lower()
     if mode != "on":
         return False
-    # This app cannot infer two-party consent states; honor configuration strictly.
+    # Honor configuration strictly; this app cannot infer consent states.
     if _runtime.recording_jurisdiction_mode == "disable_in_two_party":
         return False
     return True
 
 
 def _compose_followup_prompts(turn_seed: int) -> List[str]:
-    """
-    Returns one or two lines for assistant follow-up. Uses rotating prompts if available.
-    """
     if _runtime.rotate_prompts and IV_PROMPTS:
         idx = abs(turn_seed) % len(IV_PROMPTS)
-        text = IV_PROMPTS[idx].format(
-            company_name=_runtime.company_name or "",
-            topic=_runtime.topic or "the topic",
-        )
+        try:
+            text = IV_PROMPTS[idx].format(
+                company_name=_runtime.company_name or "",
+                topic=_runtime.topic or "the topic",
+            )
+        except Exception:
+            text = IV_PROMPTS[idx]
         parts = [p.strip() for p in text.split("||") if p.strip()]
         return parts[:2] if parts else ["Could you elaborate?", "What details can you provide?"]
-    # Fallback generic follow-ups
     return ["Could you clarify?", "What details can you share?"]
 
 
 def _compose_assistant_reply(call_sid: str, turn: int) -> List[str]:
-    """
-    Determines assistant lines to speak for a given turn index.
-    turn == 1 uses the second line of the dialog set.
-    turn >= 2 uses rotating professional prompts where available.
-    """
     params = _get_params_for_sid(call_sid)
     if turn <= 1:
         dialog_lines = _get_dialog_lines(params.dialog_idx)
@@ -637,21 +664,43 @@ def _compose_assistant_reply(call_sid: str, turn: int) -> List[str]:
     return _compose_followup_prompts(seed)
 
 
+def _diagnostics_ready_to_call() -> Tuple[bool, List[str]]:
+    reasons: List[str] = []
+    if not _runtime.to_number:
+        reasons.append("missing_to_number")
+    from_n = _choose_from_number()
+    if not from_n:
+        reasons.append("missing_from_number")
+    if not _runtime.public_base_url:
+        reasons.append("missing_public_base_url")
+    if _ensure_twilio_client() is None:
+        reasons.append("twilio_client_not_initialized")
+    return (len(reasons) == 0), reasons
+
+
 def _place_call_now() -> bool:
-    """
-    Attempt to place a call once, returning True if Twilio accepted the request.
-    Sets 'outgoing pending' immediately to prevent duplicates before callbacks.
-    Also preselects voice/dialog for the call.
-    """
     client = _ensure_twilio_client()
     from_n = _choose_from_number()
     public_url = _runtime.public_base_url or ""
-    if not client or not from_n or not public_url:
+    to_n = _runtime.to_number
+
+    if not client:
+        log.error("Cannot place call: Twilio client missing.")
         return False
+    if not to_n:
+        log.error("Cannot place call: TO_NUMBER is not configured.")
+        return False
+    if not from_n:
+        log.error("Cannot place call: FROM_NUMBER or FROM_NUMBERS is not configured.")
+        return False
+    if not public_url:
+        log.error("Cannot place call: PUBLIC_BASE_URL is not set and USE_NGROK is disabled.")
+        return False
+
     try:
         _prepare_params_for_next_call()
         kwargs: Dict[str, Any] = dict(
-            to=_runtime.to_number,
+            to=to_n,
             from_=from_n,
             url=f"{public_url}/voice",
             status_callback=f"{public_url}/status",
@@ -665,18 +714,23 @@ def _place_call_now() -> bool:
                 "recording_status_callback_event": ["in-progress", "completed"],
                 "recording_status_callback_method": "POST",
             })
+        log.info(
+            "Placing call: to=%s, from=%s, url=%s",
+            _mask_phone(kwargs["to"]),
+            _mask_phone(kwargs["from_"]),
+            kwargs["url"],
+        )
         call = client.calls.create(**kwargs)  # type: ignore
         sid = getattr(call, "sid", "") or ""
-        logging.info("Placed call: %s", sid or "<sid>")
-        _note_attempt(time.time(), _runtime.to_number)
+        log.info("Twilio accepted call. CallSid=%s", _mask_sid(sid) or "<none>")
+        _note_attempt(time.time(), to_n)
         _mark_outgoing_pending()
-        # Initialize early meta (finalized by callbacks)
         if sid:
             _assign_params_to_sid(sid)
-            _init_call_meta_if_absent(sid, to=_runtime.to_number, from_n=from_n, started_at=int(time.time()))
+            _init_call_meta_if_absent(sid, to=to_n, from_n=from_n, started_at=int(time.time()))
         return True
     except Exception as e:
-        logging.error("Twilio call placement failed: %s", e)
+        log.exception("Twilio call placement failed: %s", e)
         return False
 
 
@@ -687,59 +741,95 @@ def _initialize_schedule_if_needed(now: int) -> None:
             _interval_total_seconds = _compute_next_interval_seconds()
             _interval_start_epoch_s = now
             _next_call_epoch_s = now + int(_interval_total_seconds or 0)
+            log.info(
+                "Initialized schedule: next_call_epoch=%s (in %ss), interval_total=%ss",
+                _next_call_epoch_s,
+                (_next_call_epoch_s - now) if _next_call_epoch_s else None,
+                _interval_total_seconds,
+            )
 
 
 def _reset_schedule_after_completion(now: int) -> None:
     global _next_call_epoch_s, _interval_start_epoch_s, _interval_total_seconds
     with _next_call_epoch_s_lock:
         interval = _compute_next_interval_seconds()
+        prev_next = _next_call_epoch_s
         _interval_total_seconds = interval
         _interval_start_epoch_s = now
         _next_call_epoch_s = now + int(interval)
+        log.info(
+            "Reset schedule after completion: prev_next=%s, new_next=%s (in %ss), interval_total=%ss",
+            prev_next,
+            _next_call_epoch_s,
+            (_next_call_epoch_s - now) if _next_call_epoch_s else None,
+            _interval_total_seconds,
+        )
 
 
 def _dialer_loop() -> None:
-    logging.info("Dialer thread started.")
+    log.info("Dialer thread started.")
     while not _stop_requested.is_set():
-        now = int(time.time())
-        _initialize_schedule_if_needed(now)
+        try:
+            now = int(time.time())
+            _initialize_schedule_if_needed(now)
 
-        # Manual request
-        if _manual_call_requested.is_set():
-            _manual_call_requested.clear()
-            if _runtime.to_number:
-                if (_get_current_call_sid() is None) and _within_active_window(_now_local()):
-                    can, wait_s = _can_attempt(now, _runtime.to_number)
+            # Manual request
+            if _manual_call_requested.is_set():
+                _manual_call_requested.clear()
+                log.info("Manual call request received.")
+                ready, reasons = _diagnostics_ready_to_call()
+                if not ready:
+                    log.error("Manual call suppressed; not ready: %s", reasons)
+                else:
+                    if (_get_current_call_sid() is None) and _within_active_window(_now_local()):
+                        can, wait_s = _can_attempt(now, _runtime.to_number)
+                        if can:
+                            ok = _place_call_now()
+                            if not ok:
+                                log.error("Manual call attempt failed. Rescheduling.")
+                                _reset_schedule_after_completion(now)
+                        else:
+                            log.info("Manual attempt blocked by caps; wait %s seconds.", wait_s)
+
+            # Automatic schedule-based attempt
+            with _next_call_epoch_s_lock:
+                ready_time = (_next_call_epoch_s is not None and now >= _next_call_epoch_s)
+                seconds_until = max(0, (_next_call_epoch_s - now)) if _next_call_epoch_s else None
+
+            if ready_time:
+                log.info("Schedule window reached. seconds_until_next=%s", seconds_until)
+                diag_ready, diag_reasons = _diagnostics_ready_to_call()
+                if not diag_ready:
+                    log.error("Scheduled attempt suppressed; not ready: %s", diag_reasons)
+                    _reset_schedule_after_completion(now)
+                elif _is_outgoing_pending():
+                    log.info("Scheduled attempt suppressed; reason=outgoing_pending")
+                elif _get_current_call_sid() is not None:
+                    log.info("Scheduled attempt suppressed; reason=current_call_in_progress sid=%s", _mask_sid(_get_current_call_sid()))
+                elif not _within_active_window(_now_local()):
+                    log.info("Scheduled attempt suppressed; reason=outside_active_window")
+                    _reset_schedule_after_completion(now)
+                else:
+                    can, _ = _can_attempt(now, _runtime.to_number)
                     if can:
                         ok = _place_call_now()
                         if not ok:
+                            log.error("Scheduled call attempt failed. Rescheduling.")
                             _reset_schedule_after_completion(now)
                     else:
-                        logging.info("Attempt capped; wait %s seconds.", wait_s)
-                else:
-                    logging.info("Call busy or outside active window; manual attempt suppressed.")
-            else:
-                logging.info("TO_NUMBER not configured; manual attempt ignored.")
+                        log.info("Scheduled attempt blocked by caps; rescheduling.")
+                        _reset_schedule_after_completion(now)
 
-        # Automatic schedule-based attempt
-        with _next_call_epoch_s_lock:
-            ready = (_next_call_epoch_s is not None and now >= _next_call_epoch_s)
-        if ready and _runtime.to_number and not _is_call_busy() and _within_active_window(_now_local()):
-            can, _ = _can_attempt(now, _runtime.to_number)
-            if can:
-                ok = _place_call_now()
-                if not ok:
-                    _reset_schedule_after_completion(now)
-            else:
-                _reset_schedule_after_completion(now)
+            # Sleep in short steps for responsiveness on shutdown
+            for _ in range(5):
+                if _stop_requested.is_set():
+                    break
+                time.sleep(0.2)
+        except Exception as e:
+            log.exception("Dialer loop error: %s", e)
+            time.sleep(0.5)
 
-        # Sleep in short steps for responsiveness on shutdown
-        for _ in range(5):
-            if _stop_requested.is_set():
-                break
-            time.sleep(0.2)
-
-    logging.info("Dialer thread stopped.")
+    log.info("Dialer thread stopped.")
 
 
 # Transcripts and call metadata
@@ -759,6 +849,7 @@ def _append_transcript(call_sid: str, role: str, text: str, is_final: bool) -> N
     entry = {"t": time.time(), "role": role, "text": text, "final": bool(is_final)}
     with _TRANSCRIPTS_LOCK:
         _TRANSCRIPTS.setdefault(call_sid, []).append(entry)
+    log.debug("Transcript appended (%s): role=%s, final=%s, len(text)=%s", _mask_sid(call_sid), role, is_final, len(text))
 
 
 def _init_call_meta_if_absent(sid: str, **kwargs: Any) -> None:
@@ -770,6 +861,7 @@ def _init_call_meta_if_absent(sid: str, **kwargs: Any) -> None:
         for k, v in kwargs.items():
             if k not in meta or meta.get(k) in (None, "", 0):
                 meta[k] = v
+    log.debug("Initialized call meta if absent for %s with keys=%s", _mask_sid(sid), list(kwargs.keys()))
 
 
 def _persist_call_history(sid: str) -> None:
@@ -788,8 +880,9 @@ def _persist_call_history(sid: str) -> None:
         p = HISTORY_DIR / f"{sid}.json"
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        log.info("Persisted call history for %s (%s entries).", _mask_sid(sid), len(transcript))
     except Exception as e:
-        logging.error("Failed to persist call history: %s", e)
+        log.error("Failed to persist call history: %s", e)
 
 
 def _load_call_history(sid: str) -> Optional[Dict[str, Any]]:
@@ -832,20 +925,47 @@ def _scan_history_summaries(limit: int = 200) -> List[Dict[str, Any]]:
     return out
 
 
+def _log_runtime_summary(context: str = "startup") -> None:
+    ready, reasons = _diagnostics_ready_to_call()
+    log.info(
+        "Runtime summary (%s): to=%s, from_single=%s, from_pool=%s, public_url_set=%s, "
+        "active_hours=%s on %s, interval=%ss..%ss, caps(hour/day)=%s/%s, rotate_prompts=%s, "
+        "media_streams=%s, use_ngrok=%s, ready_to_call=%s, not_ready_reasons=%s",
+        context,
+        _mask_phone(_runtime.to_number),
+        _mask_phone(_runtime.from_number),
+        ",".join(_mask_phone(n) for n in _runtime.from_numbers) or "-",
+        bool(_runtime.public_base_url),
+        _runtime.active_hours_local,
+        ",".join(_runtime.active_days),
+        _runtime.min_interval_seconds,
+        _runtime.max_interval_seconds,
+        _runtime.hourly_max_attempts,
+        _runtime.daily_max_attempts,
+        _runtime.rotate_prompts,
+        _runtime.enable_media_streams,
+        _runtime.use_ngrok,
+        ready,
+        reasons,
+    )
+
+
 # UI routes
 @app.route("/")
 def root():
+    log.info("GET / -> redirect to /scamcalls")
     return redirect(url_for("scamcalls"))
 
 
 @app.route("/scamcalls", methods=["GET"])
 def scamcalls():
+    log.info("GET /scamcalls (admin=%s)", _admin_authenticated())
     return render_template("scamcalls.html", is_admin=_admin_authenticated())
 
 
 @app.route("/scamcalls/history", methods=["GET"])
 def scamcalls_history():
-    # The included templates/history.html has its own inline script to fetch /api/history.
+    log.info("GET /scamcalls/history")
     return render_template("history.html")
 
 
@@ -864,6 +984,7 @@ def _admin_authenticated() -> bool:
 
 def _require_admin_for_api() -> Optional[Response]:
     if not _admin_authenticated():
+        log.warning("Admin API unauthorized access attempt.")
         return Response(json.dumps({"error": "unauthorized"}), status=401, mimetype="application/json")
     return None
 
@@ -872,20 +993,23 @@ def _require_admin_for_api() -> Optional[Response]:
 def admin_login():
     if request.method == "GET":
         if _admin_authenticated():
+            log.info("GET /admin/login: already authenticated -> redirect")
             return redirect(url_for("scamcalls"))
+        log.info("GET /admin/login: render login page")
         return render_template("admin_login.html", error=None)
     username = (request.form.get("username") or "").strip()
-    password = (request.form.get("password") or "").strip()
+    # Do not log password
     effective_user, effective_hash, uses_hash = _admin_defaults()
     ok = False
     if uses_hash and effective_hash and bcrypt is not None:
         if username == effective_user:
             try:
-                ok = bcrypt.checkpw(password.encode("utf-8"), effective_hash.encode("utf-8"))
+                ok = bcrypt.checkpw((request.form.get("password") or "").encode("utf-8"), effective_hash.encode("utf-8"))
             except Exception:
                 ok = False
     else:
-        ok = (username == effective_user and password == "scammers")
+        ok = (username == effective_user and (request.form.get("password") or "") == "scammers")
+    log.info("POST /admin/login: user=%s, success=%s, uses_hash=%s", username, ok, uses_hash)
     if not ok:
         return render_template("admin_login.html", error="Invalid credentials.")
     session["is_admin"] = True
@@ -894,6 +1018,7 @@ def admin_login():
 
 @app.route("/admin/logout", methods=["GET"])
 def admin_logout():
+    log.info("GET /admin/logout")
     session.pop("is_admin", None)
     return redirect(url_for("scamcalls"))
 
@@ -905,6 +1030,7 @@ def api_admin_env_get():
     if resp:
         return resp
     editable = [{"key": k, "value": v} for (k, v) in _current_env_editable_pairs()]
+    log.info("GET /api/admin/env -> %s keys", len(editable))
     return jsonify({"editable": editable})
 
 
@@ -917,6 +1043,7 @@ def api_admin_env_post():
         data = request.get_json(force=True, silent=False) or {}
         updates_raw = data.get("updates") or {}
         if not isinstance(updates_raw, dict):
+            log.error("POST /api/admin/env invalid payload type.")
             return Response("Invalid payload.", status=400)
         clean_updates: Dict[str, str] = {}
         for k, v in updates_raw.items():
@@ -924,10 +1051,11 @@ def api_admin_env_post():
                 continue
             if k in _EDITABLE_ENV_KEYS:
                 clean_updates[str(k)] = "" if v is None else str(v)
+        log.info("POST /api/admin/env applying %s updates.", len(clean_updates))
         _apply_env_updates(clean_updates)
         return jsonify({"ok": True})
     except Exception as e:
-        logging.error("Failed to save env updates: %s", e)
+        log.exception("Failed to save env updates: %s", e)
         return Response("Failed to save settings.", status=500)
 
 
@@ -966,6 +1094,8 @@ def api_status():
     if interval_start is not None and interval_total is not None:
         interval_elapsed = None if call_in_progress else max(0, now_i - interval_start)
 
+    ready, reasons = _diagnostics_ready_to_call()
+
     payload = {
         "now_epoch": now_i,
         "next_call_epoch": next_epoch,
@@ -987,7 +1117,10 @@ def api_status():
         "call_in_progress": call_in_progress,
         "media_streams_enabled": bool(_runtime.enable_media_streams),
         "public_base_url": _runtime.public_base_url or "",
+        "ready_to_call": ready,
+        "not_ready_reasons": reasons,
     }
+    log.debug("GET /api/status -> in_progress=%s, seconds_until_next=%s, ready=%s, reasons=%s", call_in_progress, seconds_until_next, ready, reasons)
     return jsonify(payload)
 
 
@@ -997,6 +1130,7 @@ def api_live_transcript():
     sid = _get_current_call_sid()
     with _TRANSCRIPTS_LOCK:
         transcript = list(_TRANSCRIPTS.get(sid or "", [])) if sid else []
+    log.debug("GET /api/live -> in_progress=%s, sid=%s, entries=%s", bool(sid), _mask_sid(sid), len(transcript))
     return jsonify({
         "ok": True,
         "in_progress": bool(sid),
@@ -1009,23 +1143,27 @@ def api_live_transcript():
 # History APIs
 @app.route("/api/history", methods=["GET"])
 def api_history_list():
-    return jsonify({"calls": _scan_history_summaries()})
+    items = _scan_history_summaries()
+    log.info("GET /api/history -> %s items", len(items))
+    return jsonify({"calls": items})
 
 
 @app.route("/api/history/<sid>", methods=["GET"])
 def api_history_detail(sid: str):
     d = _load_call_history(sid)
     if not d:
+        log.info("GET /api/history/%s -> 404", _mask_sid(sid))
         return Response("Not found", status=404)
+    log.info("GET /api/history/%s -> ok", _mask_sid(sid))
     return jsonify(d)
 
 
 @app.route("/api/recording/<recording_sid>", methods=["GET"])
 def api_recording_proxy(recording_sid: str):
-    # Streams the MP3 of a Twilio recording.
     account_sid = os.environ.get("TWILIO_ACCOUNT_SID", "")
     auth_token = os.environ.get("TWILIO_AUTH_TOKEN", "")
     if not account_sid or not auth_token:
+        log.error("Recording fetch failed: Twilio credentials not configured.")
         return Response("Twilio credentials not configured.", status=500)
     url = f"https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Recordings/{recording_sid}.mp3"
     req = urllib.request.Request(url)
@@ -1034,9 +1172,10 @@ def api_recording_proxy(recording_sid: str):
     try:
         with urllib.request.urlopen(req, timeout=20) as resp:
             data = resp.read()
+            log.info("Proxied recording %s (%s bytes).", recording_sid, len(data))
             return Response(data, status=200, mimetype="audio/mpeg")
     except Exception as e:
-        logging.error("Failed to stream recording %s: %s", recording_sid, e)
+        log.error("Failed to stream recording %s: %s", recording_sid, e)
         return Response("Recording unavailable.", status=404)
 
 
@@ -1050,6 +1189,8 @@ def _pop_one_shot_opening() -> Optional[str]:
     with _ONE_SHOT_GREETING_LOCK:
         val = _ONE_SHOT_GREETING
         _ONE_SHOT_GREETING = None
+        if val:
+            log.info("One-shot greeting consumed (len=%s).", len(val))
         return val
 
 
@@ -1062,19 +1203,16 @@ def api_next_greeting():
     phrase = (data.get("phrase") or "").strip()
     words = [w for w in re.split(r"\s+", phrase) if w]
     if not (5 <= len(words) <= 15):
+        log.info("POST /api/next-greeting rejected: words=%s", len(words))
         return Response("Phrase must be between 5 and 15 words.", status=400)
     global _ONE_SHOT_GREETING
     with _ONE_SHOT_GREETING_LOCK:
         _ONE_SHOT_GREETING = phrase
+    log.info("POST /api/next-greeting accepted: words=%s, len=%s", len(words), len(phrase))
     return jsonify(ok=True)
 
 
 def _build_opening_lines_for_sid(call_sid: str) -> List[str]:
-    """
-    Build opening lines for this call. If a one-shot greeting is present, use that.
-    Otherwise, use the first line from the selected dialog for this call.
-    Optionally append company/topic context.
-    """
     one = _pop_one_shot_opening()
     if one:
         lines = [one]
@@ -1087,21 +1225,26 @@ def _build_opening_lines_for_sid(call_sid: str) -> List[str]:
         lines.append(f"This is {_runtime.company_name}.")
     if _runtime.topic:
         lines.append(f"I am calling about {_runtime.topic}.")
+    log.info("Opening lines prepared for %s: count=%s", _mask_sid(call_sid), len(lines))
     return [ln for ln in lines if ln]
 
 
 # Twilio voice routes
 @app.route("/voice", methods=["POST", "GET"])
 def voice_entrypoint():
-    """
-    Entry point for the call.
-    Behavior: Wait for the callee to speak first, then the assistant starts talking.
-    """
     if VoiceResponse is None:
+        log.error("Server missing Twilio TwiML library.")
         return Response("Server missing Twilio TwiML library.", status=500)
     vr = VoiceResponse()
 
     call_sid = request.values.get("CallSid", "") or None
+    log.info(
+        "ENTRY /voice: CallSid=%s, To=%s, From=%s, Method=%s",
+        _mask_sid(call_sid),
+        _mask_phone(request.values.get("To") or _runtime.to_number),
+        _mask_phone(request.values.get("From")),
+        request.method,
+    )
     if call_sid:
         _set_current_call_sid(call_sid)
         _clear_outgoing_pending()
@@ -1121,8 +1264,9 @@ def voice_entrypoint():
             start.stream(url=f"{ws_base}/media-in", track="inbound_track")
             start.stream(url=f"{ws_base}/media-out", track="outbound_track")
             vr.append(start)
+            log.info("Attached media streams to call.")
         except Exception as e:
-            logging.warning("Failed to attach media streams: %s", e)
+            log.warning("Failed to attach media streams: %s", e)
 
     # Wait for callee to speak first
     g = Gather(
@@ -1137,23 +1281,19 @@ def voice_entrypoint():
         language=_runtime.tts_language,
     )
     vr.append(g)
-
-    # In case the gather times out and Twilio falls through, provide a fallback redirect to action
     vr.redirect(url_for("hello_got_speech", _external=True), method="POST")
     return Response(str(vr), status=200, mimetype="text/xml")
 
 
 @app.route("/hello", methods=["POST"])
 def hello_got_speech():
-    """
-    Called after the initial Gather when the callee speaks (or on timeout via redirect).
-    Respond with opening lines, then listen again (continue to /dialog for back-and-forth).
-    """
     if VoiceResponse is None:
+        log.error("Server missing Twilio TwiML library.")
         return Response("Server missing Twilio TwiML library.", status=500)
     vr = VoiceResponse()
 
     call_sid = request.values.get("CallSid", "") or ""
+    log.info("ENTRY /hello: CallSid=%s", _mask_sid(call_sid))
     if call_sid:
         _set_current_call_sid(call_sid)
         _clear_outgoing_pending()
@@ -1166,6 +1306,7 @@ def hello_got_speech():
         )
 
     speech_text = (request.values.get("SpeechResult") or "").strip()
+    log.info("Hello stage SpeechResult present=%s, len=%s", bool(speech_text), len(speech_text))
     if speech_text:
         _append_transcript(call_sid, "Callee", speech_text, is_final=True)
 
@@ -1177,7 +1318,6 @@ def hello_got_speech():
         if i < len(opening_lines) - 1:
             vr.pause(length=1)
 
-    # Now listen again for callee's response and continue in /dialog
     g = Gather(
         input="speech",
         method="POST",
@@ -1190,7 +1330,6 @@ def hello_got_speech():
         language=_runtime.tts_language,
     )
     vr.append(g)
-    # If no response, politely end the call
     vr.say("Goodbye.", voice=params.voice, language=_runtime.tts_language)
     vr.hangup()
     return Response(str(vr), status=200, mimetype="text/xml")
@@ -1198,32 +1337,31 @@ def hello_got_speech():
 
 @app.route("/dialog", methods=["POST"])
 def dialog():
-    """
-    Back-and-forth conversation loop. Each hit is one callee turn -> assistant reply,
-    then another gather until limit or silence timeout.
-    """
     if VoiceResponse is None:
+        log.error("Server missing Twilio TwiML library.")
         return Response("Server missing Twilio TwiML library.", status=500)
     vr = VoiceResponse()
 
     call_sid = request.values.get("CallSid", "") or ""
+    turn = _parse_int(request.args.get("turn"), 1)
+    log.info("ENTRY /dialog: CallSid=%s, turn=%s", _mask_sid(call_sid), turn)
+
     _set_current_call_sid(call_sid or _get_current_call_sid())
 
-    turn = _parse_int(request.args.get("turn"), 1)
     speech_text = (request.values.get("SpeechResult") or "").strip()
+    log.info("Dialog SpeechResult present=%s, len=%s", bool(speech_text), len(speech_text))
     if speech_text:
         _append_transcript(call_sid, "Callee", speech_text, is_final=True)
 
     params = _get_params_for_sid(call_sid)
-    # Assistant replies
     reply_lines = _compose_assistant_reply(call_sid, turn)
+    log.info("Assistant reply line count=%s", len(reply_lines))
     for i, line in enumerate(reply_lines):
         _append_transcript(call_sid, "Assistant", line, is_final=True)
         vr.say(line, voice=params.voice, language=_runtime.tts_language)
         if i < len(reply_lines) - 1:
             vr.pause(length=1)
 
-    # If we have remaining turns, gather again; else end.
     if turn < _runtime.max_dialog_turns:
         next_turn = turn + 1
         g = Gather(
@@ -1250,8 +1388,11 @@ def dialog():
 @app.route("/transcribe-partial", methods=["POST"])
 def transcribe_partial():
     call_sid = request.values.get("CallSid", "") or ""
+    stage = request.args.get("stage") or "unknown"
+    seq = request.args.get("seq") or ""
     _set_current_call_sid(call_sid or _get_current_call_sid())
     part = (request.values.get("UnstableSpeechResult") or request.values.get("SpeechResult") or "").strip()
+    log.debug("Partial transcription: stage=%s seq=%s sid=%s present=%s len=%s", stage, seq, _mask_sid(call_sid), bool(part), len(part))
     if part:
         _append_transcript(call_sid, "Callee", part, is_final=False)
     return ("", 204)
@@ -1259,10 +1400,6 @@ def transcribe_partial():
 
 @app.route("/status", methods=["POST"])
 def status_callback():
-    """
-    Twilio status callback: initiated, ringing, answered, completed.
-    Used to toggle 'call_in_progress' and to reset the schedule after completion.
-    """
     call_sid = request.values.get("CallSid", "") or ""
     call_status = (request.values.get("CallStatus") or "").lower()
     answered_by = request.values.get("AnsweredBy") or ""
@@ -1271,13 +1408,15 @@ def status_callback():
     to_n = request.values.get("To") or ""
     from_n = request.values.get("From") or ""
 
-    logging.info(
-        "Status cb: sid=%s status=%s answered_by=%s sip=%s duration=%s",
-        call_sid,
+    log.info(
+        "Twilio status: sid=%s status=%s answered_by=%s sip=%s duration=%s to=%s from=%s",
+        _mask_sid(call_sid),
         call_status,
         answered_by,
         sip_code,
         duration,
+        _mask_phone(to_n),
+        _mask_phone(from_n),
     )
 
     now = int(time.time())
@@ -1301,7 +1440,6 @@ def status_callback():
                 meta["voice"] = cp.voice
                 meta["dialog_idx"] = cp.dialog_idx
         _persist_call_history(call_sid)
-        # Optionally prune in-memory transcript after persisting
         with _TRANSCRIPTS_LOCK:
             _TRANSCRIPTS.pop(call_sid, None)
         _reset_schedule_after_completion(now)
@@ -1311,13 +1449,10 @@ def status_callback():
 
 @app.route("/recording-status", methods=["POST"])
 def recording_status():
-    """
-    Twilio recording status callback.
-    Use to track recording SIDs associated with a call for history playback.
-    """
     call_sid = request.values.get("CallSid", "") or ""
     rec_sid = request.values.get("RecordingSid", "") or ""
     status = (request.values.get("RecordingStatus") or "").lower()
+    log.info("Recording status: call=%s rec=%s status=%s", _mask_sid(call_sid), rec_sid, status)
     if call_sid and rec_sid:
         with _CALL_META_LOCK:
             meta = _CALL_META.setdefault(call_sid, {})
@@ -1326,7 +1461,6 @@ def recording_status():
                 if not any(r.get("recording_sid") == rec_sid for r in recs):
                     recs.append({"recording_sid": rec_sid, "status": status})
             else:
-                # Update status if present
                 for r in recs:
                     if r.get("recording_sid") == rec_sid:
                         r["status"] = status
@@ -1349,20 +1483,25 @@ def _broadcast_audio(payload_b64: str) -> None:
         return
     with _AUDIO_CLIENTS_LOCK:
         clients = list(_AUDIO_CLIENTS)
+    drop_count = 0
     for ws in clients:
         try:
             ws.send(payload_b64)
         except Exception:
+            drop_count += 1
             try:
                 with _AUDIO_CLIENTS_LOCK:
                     _AUDIO_CLIENTS.discard(ws)
             except Exception:
                 pass
+    if drop_count:
+        log.info("Cleaned up %s disconnected audio clients.", drop_count)
 
 
 if _sock is not None:
     @_sock.route("/media-in")
     def media_in(ws):  # type: ignore
+        log.info("WebSocket connected: /media-in")
         try:
             while True:
                 msg = ws.receive()
@@ -1376,33 +1515,40 @@ if _sock is not None:
                     payload = data.get("media", {}).get("payload", "")
                     if payload:
                         _broadcast_audio(payload)
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning("WebSocket /media-in closed with error: %s", e)
+        finally:
+            log.info("WebSocket disconnected: /media-in")
 
     @_sock.route("/media-out")
     def media_out(ws):  # type: ignore
+        log.info("WebSocket connected: /media-out")
         try:
             while True:
                 msg = ws.receive()
                 if msg is None:
                     break
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning("WebSocket /media-out closed with error: %s", e)
+        finally:
+            log.info("WebSocket disconnected: /media-out")
 
     @_sock.route("/client-audio")
     def client_audio(ws):  # type: ignore
         with _AUDIO_CLIENTS_LOCK:
             _AUDIO_CLIENTS.add(ws)
+        log.info("WebSocket client connected: /client-audio (clients=%s)", len(_AUDIO_CLIENTS))
         try:
             while True:
                 msg = ws.receive()
                 if msg is None:
                     break
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning("WebSocket /client-audio closed with error: %s", e)
         finally:
             with _AUDIO_CLIENTS_LOCK:
                 _AUDIO_CLIENTS.discard(ws)
+            log.info("WebSocket client disconnected: /client-audio (clients=%s)", len(_AUDIO_CLIENTS))
 
 
 # Ngrok management
@@ -1412,21 +1558,23 @@ _active_tunnel_url: Optional[str] = None
 def _start_ngrok_if_enabled() -> None:
     global _active_tunnel_url
     if not _runtime.use_ngrok:
+        log.info("Ngrok disabled (USE_NGROK=false).")
         return
     if ngrok_lib is None:
-        logging.warning("USE_NGROK=true but pyngrok is not installed. Skipping.")
+        log.warning("USE_NGROK=true but pyngrok is not installed. Skipping.")
         return
     try:
         if _active_tunnel_url:
+            log.info("Ngrok already active at %s", _active_tunnel_url)
             return
         port = _runtime.flask_port or 8080
         tun = ngrok_lib.connect(addr=port, proto="http")
         _active_tunnel_url = tun.public_url  # type: ignore
         os.environ["PUBLIC_BASE_URL"] = _active_tunnel_url
         _runtime.public_base_url = _active_tunnel_url
-        logging.info("ngrok tunnel active at %s", _active_tunnel_url)
+        log.info("ngrok tunnel active at %s", _active_tunnel_url)
     except Exception as e:
-        logging.error("Failed to start ngrok: %s", e)
+        log.error("Failed to start ngrok: %s", e)
 
 
 @atexit.register
@@ -1434,15 +1582,13 @@ def _shutdown_ngrok():
     try:
         if ngrok_lib is not None:
             ngrok_lib.kill()
+            log.info("ngrok terminated at exit.")
     except Exception:
         pass
 
 
 def _handle_termination(signum, frame):
-    """
-    Handle SIGINT/SIGTERM: stop background tasks and exit the process.
-    """
-    logging.info("Termination signal received (%s). Stopping service.", signum)
+    log.info("Termination signal received (%s). Stopping service.", signum)
     try:
         _stop_requested.set()
     except Exception:
@@ -1463,32 +1609,48 @@ def _start_background_threads() -> None:
     if _dialer_thread is None or not _dialer_thread.is_alive():
         _dialer_thread = threading.Thread(target=_dialer_loop, name="dialer-thread", daemon=True)
         _dialer_thread.start()
+        log.info("Background dialer thread started.")
 
 
 @app.route("/api/call-now", methods=["POST"])
 def api_call_now():
+    log.info("POST /api/call-now received.")
+    ready, reasons = _diagnostics_ready_to_call()
+    if not ready:
+        log.error("Call-now rejected; not ready: %s", reasons)
+        return jsonify(ok=False, reason="not_ready", message="Service not ready for outbound calls.", reasons=reasons), 400
     if not _within_active_window(_now_local()):
+        log.info("Call-now outside active window.")
         return jsonify(ok=False, reason="outside_active_window", message="Outside active calling window."), 200
     if not _runtime.to_number:
+        log.info("Call-now missing destination TO_NUMBER.")
         return jsonify(ok=False, reason="missing_destination", message="TO_NUMBER is not configured."), 400
     now = int(time.time())
     allowed, wait_s = _can_attempt(now, _runtime.to_number)
     if not allowed:
+        log.info("Call-now capped; wait %s seconds.", wait_s)
         return jsonify(ok=False, reason="cap_reached", wait_seconds=wait_s), 429
     if _get_current_call_sid() is not None:
+        log.info("Call-now suppressed; call already in progress.")
         return jsonify(ok=False, reason="already_in_progress", message="A call is already in progress."), 409
+    if _is_outgoing_pending():
+        log.info("Call-now suppressed; outgoing pending in effect.")
+        return jsonify(ok=False, reason="pending", message="A call request is already pending."), 409
     _mark_outgoing_pending()
     _manual_call_requested.set()
+    log.info("Call-now accepted; manual request queued.")
     return jsonify(ok=True)
 
 
 def main():
-    logging.info("Scam Call Console starting.")
+    log.info("Scam Call Console starting.")
+    _log_runtime_summary(context="startup")
     _start_ngrok_if_enabled()
     _start_background_threads()
     host = _runtime.flask_host or os.environ.get("FLASK_HOST", "0.0.0.0")
     port = int(_runtime.flask_port or _parse_int(os.environ.get("FLASK_PORT"), 8080))
     debug = bool(_runtime.flask_debug or _parse_bool(os.environ.get("FLASK_DEBUG"), False))
+    log.info("Starting Flask on %s:%s (debug=%s)", host, port, debug)
     app.run(host=host, port=port, debug=debug, use_reloader=False)
 
 
