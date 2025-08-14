@@ -64,6 +64,12 @@ except Exception:
     Stream = None  # type: ignore
     Gather = None  # type: ignore
 
+# Optional: Twilio custom HTTP client for timeouts
+try:
+    from twilio.http.http_client import TwilioHttpClient  # type: ignore
+except Exception:
+    TwilioHttpClient = None  # type: ignore
+
 # Optional ngrok
 try:
     from pyngrok import ngrok as ngrok_lib  # type: ignore
@@ -215,6 +221,8 @@ class RuntimeConfig:
     flask_port: int = 8080
     flask_debug: bool = False
 
+    twilio_http_timeout_seconds: int = 10  # new: fast-fail network hangs
+
 
 _runtime = RuntimeConfig()
 
@@ -283,6 +291,9 @@ def _load_runtime_from_env() -> None:
     _runtime.flask_port = _parse_int(os.environ.get("FLASK_PORT"), 8080)
     _runtime.flask_debug = _parse_bool(os.environ.get("FLASK_DEBUG"), False)
 
+    # New: Twilio HTTP timeout control
+    _runtime.twilio_http_timeout_seconds = max(3, _parse_int(os.environ.get("TWILIO_HTTP_TIMEOUT_SECONDS"), 10))
+
 
 _load_runtime_from_env()
 
@@ -316,6 +327,7 @@ _EDITABLE_ENV_KEYS = [
     "FLASK_DEBUG",
     "PUBLIC_BASE_URL",
     "DIRECT_DIAL_ON_TRIGGER",
+    "TWILIO_HTTP_TIMEOUT_SECONDS",
 ]
 
 _SECRET_ENV_KEYS = {
@@ -481,6 +493,10 @@ _twilio_client: Optional[Client] = None
 
 
 def _ensure_twilio_client() -> Optional[Client]:
+    """
+    Build the Twilio REST client with a bounded HTTP timeout to avoid
+    indefinite hangs on network issues.
+    """
     global _twilio_client
     if _twilio_client is not None:
         return _twilio_client
@@ -492,7 +508,17 @@ def _ensure_twilio_client() -> Optional[Client]:
     if not sid or not tok:
         log.error("Missing TWILIO_ACCOUNT_SID or TWILIO_AUTH_TOKEN in environment.")
         return None
-    _twilio_client = Client(sid, tok)
+
+    http_client = None
+    if TwilioHttpClient is not None:
+        try:
+            http_client = TwilioHttpClient(timeout=_runtime.twilio_http_timeout_seconds)
+            log.info("Twilio HTTP client configured with timeout=%ss.", _runtime.twilio_http_timeout_seconds)
+        except Exception as e:
+            http_client = None
+            log.warning("Failed to configure TwilioHttpClient timeout: %s", e)
+
+    _twilio_client = Client(sid, tok, http_client=http_client) if http_client else Client(sid, tok)
     log.info("Twilio client initialized (account SID present).")
     return _twilio_client
 
@@ -516,6 +542,23 @@ _CURRENT_CALL_SID: Optional[str] = None
 _PENDING_LOCK = threading.Lock()
 _PENDING_UNTIL_TS: Optional[float] = None
 _PENDING_TTL_SECONDS = 30.0  # use short TTL during diagnostics
+
+# Track last placement error to surface to UI
+_LAST_DIAL_ERROR_LOCK = threading.Lock()
+_LAST_DIAL_ERROR: Optional[Dict[str, Any]] = None
+
+
+def _set_last_dial_error(message: str) -> None:
+    global _LAST_DIAL_ERROR
+    with _LAST_DIAL_ERROR_LOCK:
+        _LAST_DIAL_ERROR = {"ts": int(time.time()), "message": message or "unknown error"}
+    log.error("Call placement error: %s", message)
+
+
+def _clear_last_dial_error() -> None:
+    global _LAST_DIAL_ERROR
+    with _LAST_DIAL_ERROR_LOCK:
+        _LAST_DIAL_ERROR = None
 
 
 def _set_current_call_sid(sid: Optional[str]) -> None:
@@ -696,7 +739,6 @@ def _diagnostics_ready_to_call() -> Tuple[bool, List[str]]:
     warnings = _public_url_warnings(_runtime.public_base_url)
     if warnings:
         reasons.extend(warnings)
-    # We are "ready" if only warnings exist (e.g., private URL), as we still want to test-call.
     fatal = [r for r in reasons if r in ("missing_to_number", "missing_from_number", "twilio_client_not_initialized")]
     return (len(fatal) == 0), reasons
 
@@ -709,15 +751,19 @@ def _place_call_now() -> bool:
 
     if not client:
         log.error("Cannot place call: Twilio client missing.")
+        _set_last_dial_error("Twilio client missing")
         return False
     if not to_n:
         log.error("Cannot place call: TO_NUMBER is not configured.")
+        _set_last_dial_error("TO_NUMBER is not configured")
         return False
     if not from_n:
         log.error("Cannot place call: FROM_NUMBER or FROM_NUMBERS is not configured.")
+        _set_last_dial_error("FROM_NUMBER or FROM_NUMBERS is not configured")
         return False
     if not public_url:
         log.error("Cannot place call: PUBLIC_BASE_URL is not set.")
+        _set_last_dial_error("PUBLIC_BASE_URL is not set")
         return False
 
     # Warn loudly if URL appears private
@@ -753,6 +799,7 @@ def _place_call_now() -> bool:
         call = client.calls.create(**kwargs)  # type: ignore
         sid = getattr(call, "sid", "") or ""
         log.info("Twilio accepted call. CallSid=%s", _mask_sid(sid) or "<none>")
+        _clear_last_dial_error()
         _note_attempt(time.time(), to_n)
         _mark_outgoing_pending()
         if sid:
@@ -760,7 +807,10 @@ def _place_call_now() -> bool:
             _init_call_meta_if_absent(sid, to=to_n, from_n=from_n, started_at=int(time.time()))
         return True
     except Exception as e:
-        log.exception("Twilio call placement failed: %s", e)
+        # Fail fast and surface to UI
+        msg = f"Twilio call placement failed: {e}"
+        log.exception(msg)
+        _set_last_dial_error(msg)
         return False
 
 
@@ -1061,7 +1111,6 @@ def admin_login():
         log.info("GET /admin/login: render login page")
         return render_template("admin_login.html", error=None)
     username = (request.form.get("username") or "").strip()
-    # Do not log password
     effective_user, effective_hash, uses_hash = _admin_defaults()
     ok = False
     if uses_hash and effective_hash and bcrypt is not None:
@@ -1159,6 +1208,9 @@ def api_status():
 
     ready, reasons = _diagnostics_ready_to_call()
 
+    with _LAST_DIAL_ERROR_LOCK:
+        last_error = dict(_LAST_DIAL_ERROR) if _LAST_DIAL_ERROR else None
+
     payload = {
         "now_epoch": now_i,
         "next_call_epoch": next_epoch,
@@ -1183,6 +1235,7 @@ def api_status():
         "public_base_url": _runtime.public_base_url or "",
         "ready_to_call": ready,
         "not_ready_reasons": reasons,
+        "last_error": last_error,  # new: surface placement error to UI
     }
     log.debug(
         "GET /api/status -> in_progress=%s, seconds_until_next=%s, pending=%s, ready=%s, reasons=%s",
@@ -1293,6 +1346,8 @@ def api_diag_state():
         next_epoch = _next_call_epoch_s
         interval_total = _interval_total_seconds
         interval_start = _interval_start_epoch_s
+    with _LAST_DIAL_ERROR_LOCK:
+        last_error = dict(_LAST_DIAL_ERROR) if _LAST_DIAL_ERROR else None
     payload = {
         "active_sid": active_sid,
         "pending": pend,
@@ -1309,6 +1364,8 @@ def api_diag_state():
         "next_call_epoch": next_epoch,
         "interval_total": interval_total,
         "interval_start": interval_start,
+        "last_error": last_error,
+        "twilio_http_timeout_seconds": _runtime.twilio_http_timeout_seconds,
     }
     log.info("GET /api/diag/state -> %s", {**payload, "to": _mask_phone(payload["to"]), "from": _mask_phone(payload["from"])})
     return jsonify(payload)
@@ -1528,6 +1585,7 @@ def status_callback():
             _set_current_call_sid(call_sid)
             _init_call_meta_if_absent(call_sid, to=to_n, from_n=from_n, started_at=now)
         _clear_outgoing_pending()
+        _clear_last_dial_error()
 
     if call_status == "completed":
         _set_current_call_sid(None)
@@ -1753,7 +1811,10 @@ def api_call_now():
         log.info("Direct call-now place_call_now result=%s", ok)
         if ok:
             return jsonify(ok=True, started=True)
-        return jsonify(ok=False, reason="twilio_error", message="Twilio call placement failed; see server logs."), 502
+        # Surface last error text
+        with _LAST_DIAL_ERROR_LOCK:
+            err = _LAST_DIAL_ERROR.get("message") if _LAST_DIAL_ERROR else "Twilio call placement failed; see server logs."
+        return jsonify(ok=False, reason="twilio_error", message=err), 502
 
     # Fallback to dialer-thread path
     _mark_outgoing_pending()
