@@ -474,8 +474,18 @@
   })();
 
   let liveTimer = null;
+
+  // Audio state (new)
   let ws = null;
   let audioCtx = null;
+  let playerNode = null;   // AudioWorkletNode (preferred)
+  let playerGain = null;   // GainNode to gate prebuffer and fade
+  let workletLoaded = false;
+  let lastBufferSamples = 0;
+  let targetBufferSeconds = 0.12; // ~120 ms jitter buffer
+  let targetBufferSamples = 0;
+
+  // Fallback (legacy) ScriptProcessor state
   let scriptNode = null;
   let audioQueue = [];
   let playing = false;
@@ -603,11 +613,19 @@
     return out; // 8 kHz mono
   }
 
-  function resampleToContextRate(src8k, contextRate) {
+  function decodeMuLawBytesToFloat32(u8) {
+    const n = u8.length | 0;
+    const out = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      out[i] = mulawDecodeSample(u8[i]);
+    }
+    return out;
+  }
+
+  function resampleToContextRate(src8k, contextRate, ratioAdjust = 1.0) {
     if (!src8k || src8k.length === 0) return src8k;
     const srcRate = 8000;
-    if (contextRate === srcRate) return src8k;
-    const ratio = contextRate / srcRate;
+    const ratio = (contextRate / srcRate) * (ratioAdjust || 1.0);
     const outLen = Math.max(1, Math.floor(src8k.length * ratio));
     const out = new Float32Array(outLen);
     for (let i = 0; i < outLen; i++) {
@@ -620,6 +638,7 @@
     return out;
   }
 
+  // Legacy fallback processing callback
   function audioProcess(ev) {
     const out = ev.outputBuffer.getChannelData(0);
     out.fill(0);
@@ -633,47 +652,154 @@
     }
   }
 
-  function startListening() {
+  function computeRatioAdjust() {
+    if (!audioCtx) return 1.0;
+    const margin = audioCtx.sampleRate * 0.04; // 40 ms
+    const diff = (lastBufferSamples || 0) - (targetBufferSamples || 0);
+    if (diff > margin * 2) return 0.98;
+    if (diff > margin) return 0.995;
+    if (diff < -margin * 2) return 1.02;
+    if (diff < -margin) return 1.005;
+    return 1.0;
+  }
+
+  async function startListening() {
     const status = qs("#listenStatus");
     const btn = qs("#btnListenLive");
 
     if (btn && btn.disabled) return;
 
     try {
+      if (!audioCtx) {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        try { await audioCtx.resume(); } catch {}
+        targetBufferSamples = Math.max(1, Math.floor(audioCtx.sampleRate * targetBufferSeconds));
+      }
+
+      // Try to initialize AudioWorklet-based player
+      if (audioCtx.audioWorklet && !workletLoaded) {
+        try {
+          await audioCtx.audioWorklet.addModule("/static/live-audio-worklet.js");
+          workletLoaded = true;
+        } catch {
+          workletLoaded = false;
+        }
+      }
+      if (workletLoaded && !playerNode) {
+        playerNode = new AudioWorkletNode(audioCtx, "live-player-processor");
+        playerNode.port.onmessage = (ev) => {
+          const d = ev.data || {};
+          if (d.type === "buffer") {
+            lastBufferSamples = d.samples | 0;
+            // Auto-unmute when prebuffer is ready
+            if (playerGain && playerGain.gain.value === 0 && lastBufferSamples >= Math.floor(targetBufferSamples * 0.6)) {
+              const t = audioCtx.currentTime;
+              playerGain.gain.cancelScheduledValues(t);
+              playerGain.gain.setValueAtTime(playerGain.gain.value, t);
+              playerGain.gain.linearRampToValueAtTime(1.0, t + 0.05);
+            }
+          }
+        };
+        playerGain = audioCtx.createGain();
+        playerGain.gain.value = 0.0; // start muted; unmute after prebuffer
+        playerNode.connect(playerGain);
+        playerGain.connect(audioCtx.destination);
+      }
+
       const scheme = location.protocol === "https:" ? "wss" : "ws";
       ws = new WebSocket(`${scheme}://${location.host}/client-audio`);
+      // Accept both string (base64) and binary frames
+      try { ws.binaryType = "arraybuffer"; } catch {}
+
       ws.onopen = async () => {
-        if (!audioCtx) {
-          audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-          try { await audioCtx.resume(); } catch {}
-          scriptNode = audioCtx.createScriptProcessor(4096, 0, 1);
-          scriptNode.onaudioprocess = audioProcess;
-          scriptNode.connect(audioCtx.destination);
+        lastBufferSamples = 0;
+        if (!workletLoaded) {
+          // Fallback to ScriptProcessor with smaller buffer to reduce latency
+          if (!scriptNode) {
+            const bufSize = 1024; // lower than 4096 to reduce lag
+            scriptNode = audioCtx.createScriptProcessor(bufSize, 0, 1);
+            scriptNode.onaudioprocess = audioProcess;
+            scriptNode.connect(audioCtx.destination);
+          }
+          playing = true;
         }
-        playing = true;
         if (status) status.textContent = "Connected";
         if (btn) btn.textContent = "Stop listening";
       };
+
       ws.onmessage = (ev) => {
-        const payloadB64 = ev.data;
-        const pcm8k = decodeMuLawToFloat32(payloadB64);
-        const pcm = resampleToContextRate(pcm8k, audioCtx ? audioCtx.sampleRate : 8000);
-        audioQueue.push(pcm);
+        try {
+          let pcm8k = null;
+
+          if (ev.data instanceof ArrayBuffer) {
+            // Binary μ-law payload (optional future server optimization)
+            pcm8k = decodeMuLawBytesToFloat32(new Uint8Array(ev.data));
+          } else if (typeof ev.data === "string") {
+            // Maintain compatibility with current server (base64 μ-law payload string)
+            // Also accept JSON if server later forwards full Twilio media envelope
+            if (ev.data.length > 0 && ev.data[0] === "{") {
+              try {
+                const obj = JSON.parse(ev.data);
+                const payloadB64 = obj && obj.media && obj.media.payload ? obj.media.payload : obj.payload;
+                if (payloadB64) {
+                  pcm8k = decodeMuLawToFloat32(payloadB64);
+                } else {
+                  return;
+                }
+              } catch {
+                // Fallback assume raw base64 string
+                pcm8k = decodeMuLawToFloat32(ev.data);
+              }
+            } else {
+              pcm8k = decodeMuLawToFloat32(ev.data);
+            }
+          } else {
+            return;
+          }
+
+          if (!pcm8k || !audioCtx) return;
+
+          const ratioAdjust = computeRatioAdjust();
+          const pcm = resampleToContextRate(pcm8k, audioCtx.sampleRate, ratioAdjust);
+
+          if (playerNode) {
+            // Transfer the underlying buffer to the worklet to minimize copies
+            if (pcm && pcm.buffer) {
+              playerNode.port.postMessage({ type: "push", pcm: pcm.buffer }, [pcm.buffer]);
+            }
+          } else {
+            // Legacy fallback path
+            audioQueue.push(pcm);
+          }
+        } catch {
+          // ignore malformed frames
+        }
       };
+
       ws.onclose = () => {
-        playing = false;
         if (status) status.textContent = "Disconnected";
         if (btn) btn.textContent = "Listen live";
+        if (!workletLoaded) {
+          playing = false;
+        } else if (playerGain && audioCtx) {
+          const t = audioCtx.currentTime;
+          playerGain.gain.cancelScheduledValues(t);
+          playerGain.gain.setValueAtTime(playerGain.gain.value, t);
+          playerGain.gain.linearRampToValueAtTime(0.0, t + 0.05);
+        }
         ws = null;
       };
+
       ws.onerror = () => {
-        playing = false;
         if (status) status.textContent = "Audio error";
         if (btn) btn.textContent = "Listen live";
         try { ws && ws.close(); } catch {}
         ws = null;
+        if (!workletLoaded) playing = false;
       };
     } catch {
+      const status = qs("#listenStatus");
+      const btn = qs("#btnListenLive");
       if (status) status.textContent = "Audio not available";
       if (btn) btn.textContent = "Listen live";
       ws = null;
@@ -685,7 +811,14 @@
     const status = qs("#listenStatus");
     try { ws && ws.close(); } catch {}
     ws = null;
-    playing = false;
+    if (!workletLoaded) {
+      playing = false;
+    } else if (playerGain && audioCtx) {
+      const t = audioCtx.currentTime;
+      playerGain.gain.cancelScheduledValues(t);
+      playerGain.gain.setValueAtTime(playerGain.gain.value, t);
+      playerGain.gain.linearRampToValueAtTime(0.0, t + 0.05);
+    }
     if (status) status.textContent = "Stopped";
     if (btn) btn.textContent = "Listen live";
   }
