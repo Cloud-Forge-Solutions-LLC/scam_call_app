@@ -3,8 +3,10 @@
 Scam Call Console: Outbound caller service with admin UI, pacing, Twilio voice,
 optional Media Streams, live transcript API, history APIs, and clean shutdown.
 
-Diagnostic build: adds comprehensive logging for call placement, scheduling,
-request handling, Twilio callbacks, env updates, and live audio streaming.
+Diagnostic build:
+- Adds comprehensive logging for call placement and scheduling
+- Fixes a deadlock that prevented placing calls (nested _PARAMS_LOCK acquisition)
+- Optional Twilio SDK HTTP debug logs via TWILIO_SDK_DEBUG=true
 
 Notes:
 - Do not store real secrets in source control; keep .env private.
@@ -98,6 +100,17 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger("scam_call_console")
+
+# Optional Twilio SDK HTTP debug (disabled by default)
+if str(os.environ.get("TWILIO_SDK_DEBUG", "false")).strip().lower() in {"1", "true", "yes", "on"}:
+    try:
+        logging.getLogger("twilio").setLevel(logging.DEBUG)
+        logging.getLogger("twilio.http_client").setLevel(logging.DEBUG)
+        logging.getLogger("twilio.http").setLevel(logging.DEBUG)
+        logging.getLogger("urllib3").setLevel(logging.DEBUG)
+        log.info("Twilio SDK HTTP debug logging enabled (TWILIO_SDK_DEBUG=true).")
+    except Exception as _e:
+        log.warning("Failed to enable Twilio SDK debug logging: %s", _e)
 
 
 def _mask_phone(val: Optional[str]) -> str:
@@ -221,7 +234,7 @@ class RuntimeConfig:
     flask_port: int = 8080
     flask_debug: bool = False
 
-    twilio_http_timeout_seconds: int = 10  # new: fast-fail network hangs
+    twilio_http_timeout_seconds: int = 10  # network call timeout
 
 
 _runtime = RuntimeConfig()
@@ -291,7 +304,6 @@ def _load_runtime_from_env() -> None:
     _runtime.flask_port = _parse_int(os.environ.get("FLASK_PORT"), 8080)
     _runtime.flask_debug = _parse_bool(os.environ.get("FLASK_DEBUG"), False)
 
-    # New: Twilio HTTP timeout control
     _runtime.twilio_http_timeout_seconds = max(3, _parse_int(os.environ.get("TWILIO_HTTP_TIMEOUT_SECONDS"), 10))
 
 
@@ -541,7 +553,7 @@ _CURRENT_CALL_SID: Optional[str] = None
 # Pending is used to block duplicate placements between calls.create and Twilio callbacks
 _PENDING_LOCK = threading.Lock()
 _PENDING_UNTIL_TS: Optional[float] = None
-_PENDING_TTL_SECONDS = 30.0  # use short TTL during diagnostics
+_PENDING_TTL_SECONDS = 30.0  # short TTL during diagnostics
 
 # Track last placement error to surface to UI
 _LAST_DIAL_ERROR_LOCK = threading.Lock()
@@ -599,14 +611,6 @@ def _is_outgoing_pending() -> bool:
         return True
 
 
-def _busy_reason() -> Optional[str]:
-    if _get_current_call_sid() is not None:
-        return "current_call_sid_set"
-    if _is_outgoing_pending():
-        return "outgoing_pending"
-    return None
-
-
 # Dialog rotation and per-call parameters
 @dataclass
 class CallParams:
@@ -631,41 +635,73 @@ _LAST_DIALOG_IDX = -1
 _PARAMS_LOCK = threading.Lock()
 
 
-def _select_next_call_params() -> CallParams:
+def _select_next_call_params_locked() -> CallParams:
+    """
+    Select next call parameters.
+    IMPORTANT: Caller must hold _PARAMS_LOCK.
+    """
     global _PLACED_CALL_COUNT, _LAST_DIALOG_IDX
-    with _PARAMS_LOCK:
-        _PLACED_CALL_COUNT += 1
-        voice = "man" if (_PLACED_CALL_COUNT % 2 == 1) else "woman"
-        _LAST_DIALOG_IDX = (_LAST_DIALOG_IDX + 1) % max(1, len(_DIALOGS))
-        log.info("Selected call params: voice=%s, dialog_idx=%s", voice, _LAST_DIALOG_IDX)
-        return CallParams(voice=voice, dialog_idx=_LAST_DIALOG_IDX)
+    _PLACED_CALL_COUNT += 1
+    voice = "man" if (_PLACED_CALL_COUNT % 2 == 1) else "woman"
+    _LAST_DIALOG_IDX = (_LAST_DIALOG_IDX + 1) % max(1, len(_DIALOGS))
+    cp = CallParams(voice=voice, dialog_idx=_LAST_DIALOG_IDX)
+    log.info("Selected call params: voice=%s, dialog_idx=%s", cp.voice, cp.dialog_idx)
+    return cp
 
 
 def _prepare_params_for_next_call() -> None:
+    """
+    Prepare and store pending call params for the next outbound call.
+    """
     global _PENDING_CALL_PARAMS
-    with _PARAMS_LOCK:
-        _PENDING_CALL_PARAMS = _select_next_call_params()
-    log.info("Prepared params for next call: %s", _PENDING_CALL_PARAMS)
+    log.info("Preparing params for next call (acquiring _PARAMS_LOCK).")
+    acquired = _PARAMS_LOCK.acquire(timeout=10.0)
+    if not acquired:
+        log.error("Timeout acquiring _PARAMS_LOCK in _prepare_params_for_next_call.")
+        raise RuntimeError("Lock acquisition timeout")
+    try:
+        _PENDING_CALL_PARAMS = _select_next_call_params_locked()
+        log.info("Prepared params for next call: %s", _PENDING_CALL_PARAMS)
+    finally:
+        _PARAMS_LOCK.release()
+        log.info("Released _PARAMS_LOCK after preparing params.")
 
 
 def _assign_params_to_sid(sid: str) -> None:
+    """
+    Assign the prepared params to a specific CallSid.
+    """
     global _PENDING_CALL_PARAMS
     if not sid:
         return
-    with _PARAMS_LOCK:
+    log.info("Assigning params to SID %s (acquiring _PARAMS_LOCK).", _mask_sid(sid))
+    acquired = _PARAMS_LOCK.acquire(timeout=10.0)
+    if not acquired:
+        log.error("Timeout acquiring _PARAMS_LOCK in _assign_params_to_sid.")
+        return
+    try:
         if _PENDING_CALL_PARAMS is None:
-            _PENDING_CALL_PARAMS = _select_next_call_params()
+            _PENDING_CALL_PARAMS = _select_next_call_params_locked()
         _CALL_PARAMS_BY_SID[sid] = _PENDING_CALL_PARAMS
         log.info("Assigned params to SID %s: %s", _mask_sid(sid), _PENDING_CALL_PARAMS)
         _PENDING_CALL_PARAMS = None
+    finally:
+        _PARAMS_LOCK.release()
+        log.info("Released _PARAMS_LOCK after assigning params.")
 
 
 def _get_params_for_sid(sid: str) -> CallParams:
-    with _PARAMS_LOCK:
+    acquired = _PARAMS_LOCK.acquire(timeout=10.0)
+    if not acquired:
+        log.error("Timeout acquiring _PARAMS_LOCK in _get_params_for_sid; falling back to defaults.")
+        return CallParams(voice=_runtime.tts_voice or "man", dialog_idx=0)
+    try:
         cp = _CALL_PARAMS_BY_SID.get(sid)
         if cp:
             return cp
         return CallParams(voice=_runtime.tts_voice or "man", dialog_idx=0)
+    finally:
+        _PARAMS_LOCK.release()
 
 
 def _get_dialog_lines(idx: int) -> List[str]:
@@ -744,6 +780,10 @@ def _diagnostics_ready_to_call() -> Tuple[bool, List[str]]:
 
 
 def _place_call_now() -> bool:
+    """
+    Place an outbound call via Twilio REST API. Includes detailed step logs.
+    """
+    log.info("STEP place_call_now: start")
     client = _ensure_twilio_client()
     from_n = _choose_from_number()
     public_url = _runtime.public_base_url or ""
@@ -766,14 +806,18 @@ def _place_call_now() -> bool:
         _set_last_dial_error("PUBLIC_BASE_URL is not set")
         return False
 
-    # Warn loudly if URL appears private
     url_warn = _public_url_warnings(public_url)
     if url_warn:
         log.warning("PUBLIC_BASE_URL warnings: %s (value=%s)", url_warn, public_url)
 
     try:
         log.info("Preparing to place call (preflight). to=%s from=%s base=%s", _mask_phone(to_n), _mask_phone(from_n), public_url)
+
+        # STEP: parameter selection (fixed deadlock)
         _prepare_params_for_next_call()
+        log.info("STEP place_call_now: params prepared")
+
+        # Build Twilio call kwargs
         kwargs: Dict[str, Any] = dict(
             to=to_n,
             from_=from_n,
@@ -789,16 +833,21 @@ def _place_call_now() -> bool:
                 "recording_status_callback_event": ["in-progress", "completed"],
                 "recording_status_callback_method": "POST",
             })
+        log.info("STEP place_call_now: kwargs built (twiml_url=%s, status_cb=%s)", kwargs["url"], kwargs["status_callback"])
+
         log.info(
-            "Placing call via Twilio API. to=%s from=%s twiml_url=%s status_cb=%s",
+            "Placing call via Twilio API. to=%s from=%s twiml_url=%s",
             _mask_phone(kwargs["to"]),
             _mask_phone(kwargs["from_"]),
             kwargs["url"],
-            kwargs["status_callback"],
         )
+
+        # Execute REST create
         call = client.calls.create(**kwargs)  # type: ignore
+
         sid = getattr(call, "sid", "") or ""
         log.info("Twilio accepted call. CallSid=%s", _mask_sid(sid) or "<none>")
+
         _clear_last_dial_error()
         _note_attempt(time.time(), to_n)
         _mark_outgoing_pending()
@@ -807,7 +856,6 @@ def _place_call_now() -> bool:
             _init_call_meta_if_absent(sid, to=to_n, from_n=from_n, started_at=int(time.time()))
         return True
     except Exception as e:
-        # Fail fast and surface to UI
         msg = f"Twilio call placement failed: {e}"
         log.exception(msg)
         _set_last_dial_error(msg)
@@ -914,7 +962,7 @@ def _dialer_loop() -> None:
                     _reset_schedule_after_completion(now)
                 elif gates["pending"]:
                     log.info("Scheduled attempt suppressed; reason=outgoing_pending")
-                    _reset_schedule_after_completion(now)  # do not tight-loop on pending
+                    _reset_schedule_after_completion(now)
                 elif gates["active_sid_set"]:
                     log.info("Scheduled attempt suppressed; reason=current_call_in_progress sid=%s", _mask_sid(_get_current_call_sid()))
                     _reset_schedule_after_completion(now)
@@ -933,7 +981,6 @@ def _dialer_loop() -> None:
                         log.info("Scheduled attempt blocked by caps; rescheduling. wait=%s", gates["wait_if_capped"])
                         _reset_schedule_after_completion(now)
 
-            # Sleep in short steps for responsiveness on shutdown
             for _ in range(5):
                 if _stop_requested.is_set():
                     break
@@ -1235,7 +1282,7 @@ def api_status():
         "public_base_url": _runtime.public_base_url or "",
         "ready_to_call": ready,
         "not_ready_reasons": reasons,
-        "last_error": last_error,  # new: surface placement error to UI
+        "last_error": last_error,
     }
     log.debug(
         "GET /api/status -> in_progress=%s, seconds_until_next=%s, pending=%s, ready=%s, reasons=%s",
@@ -1415,7 +1462,6 @@ def voice_entrypoint():
             started_at=int(time.time()),
         )
 
-    # Optional Media Streams
     if _runtime.enable_media_streams and Start is not None and Stream is not None and _runtime.public_base_url:
         try:
             start = Start()
@@ -1427,7 +1473,6 @@ def voice_entrypoint():
         except Exception as e:
             log.warning("Failed to attach media streams: %s", e)
 
-    # Wait for callee to speak first
     g = Gather(
         input="speech",
         method="POST",
@@ -1780,7 +1825,6 @@ def api_call_now():
         log.error("Call-now rejected; not ready: %s", reasons)
         return jsonify(ok=False, reason="not_ready", message="Service not ready for outbound calls.", reasons=reasons), 400
 
-    # Optional direct dial path to eliminate timing/race issues during diagnostics
     direct = _parse_bool(os.environ.get("DIRECT_DIAL_ON_TRIGGER"), True)
 
     if not _within_active_window(_now_local()):
@@ -1806,17 +1850,15 @@ def api_call_now():
 
     if direct:
         log.info("Call-now taking direct path (DIRECT_DIAL_ON_TRIGGER=true).")
-        gates = _log_dialer_gates("direct_call_now")
+        _log_dialer_gates("direct_call_now")
         ok = _place_call_now()
         log.info("Direct call-now place_call_now result=%s", ok)
         if ok:
             return jsonify(ok=True, started=True)
-        # Surface last error text
         with _LAST_DIAL_ERROR_LOCK:
             err = _LAST_DIAL_ERROR.get("message") if _LAST_DIAL_ERROR else "Twilio call placement failed; see server logs."
         return jsonify(ok=False, reason="twilio_error", message=err), 502
 
-    # Fallback to dialer-thread path
     _mark_outgoing_pending()
     _manual_call_requested.set()
     log.info("Call-now accepted; manual request queued.")
@@ -1830,7 +1872,6 @@ def health():
 
 def main():
     log.info("Scam Call Console starting.")
-    # Log masked account SID if present
     acc = os.environ.get("TWILIO_ACCOUNT_SID", "")
     if acc:
         log.info("Twilio Account SID present (masked): %s", _mask_sid(acc))
