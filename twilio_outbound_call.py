@@ -1,25 +1,29 @@
 #!/usr/bin/env python3
 """
 Scam Call Console: Outbound caller service with admin UI, pacing, Twilio voice,
-optional Media Streams, live transcript API, and clean shutdown.
+optional Media Streams, live transcript API, history APIs, and clean shutdown.
 
 Updates in this version:
-- Graceful termination: Ctrl+C (SIGINT) and SIGTERM now stop the server and background threads cleanly.
+- Continuous conversation: after greeting, the caller and callee can exchange multiple turns
+  (configurable via MAX_DIALOG_TURNS) until silence or limit.
+- Graceful termination: Ctrl+C (SIGINT) and SIGTERM stop the server and background threads cleanly.
 - Wait-to-speak: Wait for the callee to speak first before the assistant starts talking.
 - Alternating voice per call: Switches assistant TTS voice between male and female every other call.
 - Rotating dialog: Each call uses a different dialog set (will cycle through the list).
-- Dialogs may include harsh language as requested.
+- Recording plumbing: Optional call recording via Twilio; adds recording status callback and
+  a proxy endpoint to stream recordings if enabled (configure legally and responsibly).
+- Call history: Persist call metadata and transcript to disk, and provide /api/history endpoints.
+- UI accuracy: Status/live endpoints report "in progress" only when a real CallSid is active.
 
-Bug fixes in this version:
-- Manual-call suppression: Manual calls were being suppressed as "busy" due to a pre-set pending flag.
-  The manual path now only blocks when an actual call SID is active.
-- UI accuracy: The status and live endpoints now report "in progress" only when a real CallSid is active,
-  not merely pending, so the UI no longer shows a call in progress when none has started yet.
+Notes:
+- Comply with all applicable laws (especially call recording).
+- Do not include real secrets in source control; use a private .env locally.
 """
 
 from __future__ import annotations
 
 import atexit
+import base64
 import json
 import logging
 import os
@@ -28,6 +32,7 @@ import re
 import signal
 import threading
 import time
+import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -42,6 +47,7 @@ from flask import (
     request,
     session,
     url_for,
+    send_file,
 )
 from werkzeug.middleware.proxy_fix import ProxyFix
 
@@ -78,6 +84,11 @@ try:
 except Exception:
     Sock = None  # type: ignore
 
+# Optional rotating prompts used for professional follow-ups
+try:
+    from rotating_iv_prompts import PROMPTS as IV_PROMPTS  # type: ignore
+except Exception:
+    IV_PROMPTS = []  # type: ignore
 
 app = Flask(__name__, static_folder="static", template_folder="templates")
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_host=1)  # type: ignore
@@ -169,6 +180,7 @@ class RuntimeConfig:
 
     tts_voice: str = "man"
     tts_language: str = "en-US"
+    max_dialog_turns: int = 6
     rotate_prompts: bool = True
     rotate_prompts_strategy: str = "random"
 
@@ -238,6 +250,7 @@ def _load_runtime_from_env() -> None:
 
     _runtime.tts_voice = (os.environ.get("TTS_VOICE") or "man").strip()
     _runtime.tts_language = (os.environ.get("TTS_LANGUAGE") or "en-US").strip()
+    _runtime.max_dialog_turns = max(0, _parse_int(os.environ.get("MAX_DIALOG_TURNS"), 6))
 
     _runtime.recording_mode = (os.environ.get("RECORDING_MODE") or "off").strip().lower()
     _runtime.recording_jurisdiction_mode = (os.environ.get("RECORDING_JURISDICTION_MODE") or "disable_in_two_party").strip().lower()
@@ -272,6 +285,7 @@ _EDITABLE_ENV_KEYS = [
     "RECORDING_JURISDICTION_MODE",
     "TTS_VOICE",
     "TTS_LANGUAGE",
+    "MAX_DIALOG_TURNS",
     "ROTATE_PROMPTS",
     "ROTATE_PROMPTS_STRATEGY",
     "COMPANY_NAME",
@@ -425,7 +439,7 @@ def _can_attempt(now_ts: int, to_number: str) -> Tuple[bool, int]:
         last_hour = [t for t in lst if t >= now_ts - 3600]
         if len(last_hour) >= _runtime.hourly_max_attempts:
             oldest = min(last_hour) if last_hour else now_ts
-            return False, max(1, (oldest + 3600) - now_ts)
+            return False, max(1, (int(oldest) + 3600) - now_ts)
         if len(lst) >= _runtime.daily_max_attempts:
             return False, 3600
     return True, 0
@@ -525,14 +539,14 @@ class CallParams:
     dialog_idx: int
 
 
-# Dialog sets. These rotate each call (mild harsh language by request).
+# Dialog sets (2-line seed; follow-ups come from rotating_iv_prompts when available).
 _DIALOGS: List[List[str]] = [
-    ["Where is my refund?", "Stop wasting my time."],
-    ["Do not stall me.", "Answer the question now."],
-    ["Cut the nonsense.", "I am not playing games."],
-    ["You clearly are not prepared.", "Get this together now."],
-    ["I expect clear answers.", "Do not try to dodge this."],
-    ["Enough delays.", "Be direct with me."],
+    ["Where is my refund?", "I need a straight answer."],
+    ["Let us skip delays.", "Please be direct."],
+    ["I expect clarity.", "Provide specifics now."],
+    ["Avoid generalities.", "Focus on the facts."],
+    ["Please explain the status.", "Outline next steps clearly."],
+    ["Confirm the details.", "Do not omit anything relevant."],
 ]
 
 _CALL_PARAMS_BY_SID: Dict[str, CallParams] = {}
@@ -546,7 +560,7 @@ def _select_next_call_params() -> CallParams:
     global _PLACED_CALL_COUNT, _LAST_DIALOG_IDX
     with _PARAMS_LOCK:
         _PLACED_CALL_COUNT += 1
-        voice = "man" if (_PLACED_CALL_COUNT % 2 == 1) else "woman"  # alternate voice each call
+        voice = "man" if (_PLACED_CALL_COUNT % 2 == 1) else "woman"
         _LAST_DIALOG_IDX = (_LAST_DIALOG_IDX + 1) % max(1, len(_DIALOGS))
         return CallParams(voice=voice, dialog_idx=_LAST_DIALOG_IDX)
 
@@ -582,6 +596,47 @@ def _get_dialog_lines(idx: int) -> List[str]:
     return _DIALOGS[idx % len(_DIALOGS)]
 
 
+def _should_record_call() -> bool:
+    mode = (_runtime.recording_mode or "off").lower()
+    if mode != "on":
+        return False
+    # This app cannot infer two-party consent states; honor configuration strictly.
+    if _runtime.recording_jurisdiction_mode == "disable_in_two_party":
+        return False
+    return True
+
+
+def _compose_followup_prompts(turn_seed: int) -> List[str]:
+    """
+    Returns one or two lines for assistant follow-up. Uses rotating prompts if available.
+    """
+    if _runtime.rotate_prompts and IV_PROMPTS:
+        idx = abs(turn_seed) % len(IV_PROMPTS)
+        text = IV_PROMPTS[idx].format(
+            company_name=_runtime.company_name or "",
+            topic=_runtime.topic or "the topic",
+        )
+        parts = [p.strip() for p in text.split("||") if p.strip()]
+        return parts[:2] if parts else ["Could you elaborate?", "What details can you provide?"]
+    # Fallback generic follow-ups
+    return ["Could you clarify?", "What details can you share?"]
+
+
+def _compose_assistant_reply(call_sid: str, turn: int) -> List[str]:
+    """
+    Determines assistant lines to speak for a given turn index.
+    turn == 1 uses the second line of the dialog set.
+    turn >= 2 uses rotating professional prompts where available.
+    """
+    params = _get_params_for_sid(call_sid)
+    if turn <= 1:
+        dialog_lines = _get_dialog_lines(params.dialog_idx)
+        reply = dialog_lines[1] if len(dialog_lines) > 1 else "Please continue."
+        return [reply]
+    seed = params.dialog_idx + turn
+    return _compose_followup_prompts(seed)
+
+
 def _place_call_now() -> bool:
     """
     Attempt to place a call once, returning True if Twilio accepted the request.
@@ -595,7 +650,7 @@ def _place_call_now() -> bool:
         return False
     try:
         _prepare_params_for_next_call()
-        call = client.calls.create(
+        kwargs: Dict[str, Any] = dict(
             to=_runtime.to_number,
             from_=from_n,
             url=f"{public_url}/voice",
@@ -603,9 +658,22 @@ def _place_call_now() -> bool:
             status_callback_event=["initiated", "ringing", "answered", "completed"],
             status_callback_method="POST",
         )
-        logging.info("Placed call: %s", getattr(call, "sid", "<sid>"))
+        if _should_record_call():
+            kwargs.update({
+                "record": True,
+                "recording_status_callback": f"{public_url}/recording-status",
+                "recording_status_callback_event": ["in-progress", "completed"],
+                "recording_status_callback_method": "POST",
+            })
+        call = client.calls.create(**kwargs)  # type: ignore
+        sid = getattr(call, "sid", "") or ""
+        logging.info("Placed call: %s", sid or "<sid>")
         _note_attempt(time.time(), _runtime.to_number)
         _mark_outgoing_pending()
+        # Initialize early meta (finalized by callbacks)
+        if sid:
+            _assign_params_to_sid(sid)
+            _init_call_meta_if_absent(sid, to=_runtime.to_number, from_n=from_n, started_at=int(time.time()))
         return True
     except Exception as e:
         logging.error("Twilio call placement failed: %s", e)
@@ -640,7 +708,6 @@ def _dialer_loop() -> None:
         if _manual_call_requested.is_set():
             _manual_call_requested.clear()
             if _runtime.to_number:
-                # Only consider "busy" when there is an actual active CallSid; ignore "pending" for manual path
                 if (_get_current_call_sid() is None) and _within_active_window(_now_local()):
                     can, wait_s = _can_attempt(now, _runtime.to_number)
                     if can:
@@ -675,9 +742,15 @@ def _dialer_loop() -> None:
     logging.info("Dialer thread stopped.")
 
 
-# Transcripts
+# Transcripts and call metadata
 _TRANSCRIPTS_LOCK = threading.Lock()
 _TRANSCRIPTS: Dict[str, List[Dict[str, Any]]] = {}
+
+_CALL_META_LOCK = threading.Lock()
+_CALL_META: Dict[str, Dict[str, Any]] = {}
+
+HISTORY_DIR = Path("data/history")
+HISTORY_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def _append_transcript(call_sid: str, role: str, text: str, is_final: bool) -> None:
@@ -686,6 +759,77 @@ def _append_transcript(call_sid: str, role: str, text: str, is_final: bool) -> N
     entry = {"t": time.time(), "role": role, "text": text, "final": bool(is_final)}
     with _TRANSCRIPTS_LOCK:
         _TRANSCRIPTS.setdefault(call_sid, []).append(entry)
+
+
+def _init_call_meta_if_absent(sid: str, **kwargs: Any) -> None:
+    with _CALL_META_LOCK:
+        meta = _CALL_META.get(sid)
+        if meta is None:
+            meta = {}
+            _CALL_META[sid] = meta
+        for k, v in kwargs.items():
+            if k not in meta or meta.get(k) in (None, "", 0):
+                meta[k] = v
+
+
+def _persist_call_history(sid: str) -> None:
+    with _CALL_META_LOCK:
+        meta = dict(_CALL_META.get(sid, {}))
+    with _TRANSCRIPTS_LOCK:
+        transcript = list(_TRANSCRIPTS.get(sid, []))
+    if not sid:
+        return
+    try:
+        payload = {
+            "sid": sid,
+            "meta": meta,
+            "transcript": transcript,
+        }
+        p = HISTORY_DIR / f"{sid}.json"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        logging.error("Failed to persist call history: %s", e)
+
+
+def _load_call_history(sid: str) -> Optional[Dict[str, Any]]:
+    p = HISTORY_DIR / f"{sid}.json"
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _scan_history_summaries(limit: int = 200) -> List[Dict[str, Any]]:
+    items: List[Tuple[float, Path]] = []
+    try:
+        for f in HISTORY_DIR.glob("*.json"):
+            try:
+                items.append((f.stat().st_mtime, f))
+            except Exception:
+                continue
+    except Exception:
+        return []
+    items.sort(key=lambda t: t[0], reverse=True)
+    out: List[Dict[str, Any]] = []
+    for _, f in items[:limit]:
+        try:
+            d = json.loads(f.read_text(encoding="utf-8"))
+            meta = d.get("meta", {}) or {}
+            out.append({
+                "sid": d.get("sid", ""),
+                "started_at": meta.get("started_at"),
+                "completed_at": meta.get("completed_at"),
+                "to": meta.get("to"),
+                "from": meta.get("from"),
+                "duration_seconds": meta.get("duration_seconds"),
+                "has_recordings": bool(meta.get("recordings")),
+            })
+        except Exception:
+            continue
+    return out
 
 
 # UI routes
@@ -699,10 +843,16 @@ def scamcalls():
     return render_template("scamcalls.html", is_admin=_admin_authenticated())
 
 
+@app.route("/scamcalls/history", methods=["GET"])
+def scamcalls_history():
+    # The included templates/history.html has its own inline script to fetch /api/history.
+    return render_template("history.html")
+
+
 # Admin auth
 def _admin_defaults() -> Tuple[str, Optional[str], bool]:
-    env_user = (_runtime.admin_user or "").strip() if _runtime.admin_user else None
-    env_hash = (_runtime.admin_password_hash or "").strip() if _runtime.admin_password_hash else None
+    env_user = (os.environ.get("ADMIN_USER") or "").strip() or (_runtime.admin_user or "").strip() if _runtime.admin_user else None
+    env_hash = (os.environ.get("ADMIN_PASSWORD_HASH") or "").strip() or (_runtime.admin_password_hash or "").strip() if _runtime.admin_password_hash else None
     if env_user and env_hash and bcrypt is not None:
         return env_user, env_hash, True
     return "bootycall", None, False
@@ -790,9 +940,7 @@ def api_status():
         interval_start = _interval_start_epoch_s
         interval_total = _interval_total_seconds
 
-    # Compute both pending and active, but expose "call_in_progress" only for a real active CallSid.
-    # This keeps the UI accurate: it should not show "active call" when we are merely pending.
-    _ = _is_outgoing_pending()  # retained for potential internal diagnostics
+    _ = _is_outgoing_pending()  # maintained for internal checks
     active_sid = _get_current_call_sid()
     call_in_progress = bool(active_sid)
 
@@ -851,12 +999,45 @@ def api_live_transcript():
         transcript = list(_TRANSCRIPTS.get(sid or "", [])) if sid else []
     return jsonify({
         "ok": True,
-        # Report in_progress only on an actual CallSid (not on "pending") to keep UI accurate.
         "in_progress": bool(sid),
         "callSid": sid or "",
         "transcript": transcript,
         "media_streams_enabled": bool(_runtime.enable_media_streams),
     })
+
+
+# History APIs
+@app.route("/api/history", methods=["GET"])
+def api_history_list():
+    return jsonify({"calls": _scan_history_summaries()})
+
+
+@app.route("/api/history/<sid>", methods=["GET"])
+def api_history_detail(sid: str):
+    d = _load_call_history(sid)
+    if not d:
+        return Response("Not found", status=404)
+    return jsonify(d)
+
+
+@app.route("/api/recording/<recording_sid>", methods=["GET"])
+def api_recording_proxy(recording_sid: str):
+    # Streams the MP3 of a Twilio recording.
+    account_sid = os.environ.get("TWILIO_ACCOUNT_SID", "")
+    auth_token = os.environ.get("TWILIO_AUTH_TOKEN", "")
+    if not account_sid or not auth_token:
+        return Response("Twilio credentials not configured.", status=500)
+    url = f"https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Recordings/{recording_sid}.mp3"
+    req = urllib.request.Request(url)
+    b64 = base64.b64encode(f"{account_sid}:{auth_token}".encode("utf-8")).decode("ascii")
+    req.add_header("Authorization", f"Basic {b64}")
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = resp.read()
+            return Response(data, status=200, mimetype="audio/mpeg")
+    except Exception as e:
+        logging.error("Failed to stream recording %s: %s", recording_sid, e)
+        return Response("Recording unavailable.", status=404)
 
 
 # One-shot greeting setter
@@ -902,7 +1083,6 @@ def _build_opening_lines_for_sid(call_sid: str) -> List[str]:
         base_dialog = _get_dialog_lines(params.dialog_idx)
         first = base_dialog[0] if base_dialog else "Hello."
         lines = [first]
-    # Optional context additions
     if _runtime.company_name:
         lines.append(f"This is {_runtime.company_name}.")
     if _runtime.topic:
@@ -915,7 +1095,7 @@ def _build_opening_lines_for_sid(call_sid: str) -> List[str]:
 def voice_entrypoint():
     """
     Entry point for the call.
-    Behavior: Wait for the callee to speak first, then the assistant responds.
+    Behavior: Wait for the callee to speak first, then the assistant starts talking.
     """
     if VoiceResponse is None:
         return Response("Server missing Twilio TwiML library.", status=500)
@@ -926,6 +1106,12 @@ def voice_entrypoint():
         _set_current_call_sid(call_sid)
         _clear_outgoing_pending()
         _assign_params_to_sid(call_sid)
+        _init_call_meta_if_absent(
+            call_sid,
+            to=(request.values.get("To") or _runtime.to_number or ""),
+            from_n=(request.values.get("From") or ""),
+            started_at=int(time.time()),
+        )
 
     # Optional Media Streams
     if _runtime.enable_media_streams and Start is not None and Stream is not None and _runtime.public_base_url:
@@ -950,7 +1136,6 @@ def voice_entrypoint():
         partial_result_callback_method="POST",
         language=_runtime.tts_language,
     )
-    # No initial speech from assistant; we are waiting for the callee
     vr.append(g)
 
     # In case the gather times out and Twilio falls through, provide a fallback redirect to action
@@ -962,7 +1147,7 @@ def voice_entrypoint():
 def hello_got_speech():
     """
     Called after the initial Gather when the callee speaks (or on timeout via redirect).
-    Respond with opening lines, then listen again.
+    Respond with opening lines, then listen again (continue to /dialog for back-and-forth).
     """
     if VoiceResponse is None:
         return Response("Server missing Twilio TwiML library.", status=500)
@@ -973,13 +1158,17 @@ def hello_got_speech():
         _set_current_call_sid(call_sid)
         _clear_outgoing_pending()
         _assign_params_to_sid(call_sid)
+        _init_call_meta_if_absent(
+            call_sid,
+            to=(request.values.get("To") or _runtime.to_number or ""),
+            from_n=(request.values.get("From") or ""),
+            started_at=int(time.time()),
+        )
 
-    # Record what callee said (if any)
     speech_text = (request.values.get("SpeechResult") or "").strip()
     if speech_text:
         _append_transcript(call_sid, "Callee", speech_text, is_final=True)
 
-    # Assistant speaks opening lines now
     params = _get_params_for_sid(call_sid)
     opening_lines = _build_opening_lines_for_sid(call_sid)
     for i, line in enumerate(opening_lines):
@@ -988,11 +1177,11 @@ def hello_got_speech():
         if i < len(opening_lines) - 1:
             vr.pause(length=1)
 
-    # Now listen again for callee's response and continue in /transcribe
+    # Now listen again for callee's response and continue in /dialog
     g = Gather(
         input="speech",
         method="POST",
-        action=url_for("transcribe", seq=1, _external=True),
+        action=url_for("dialog", turn=1, _external=True),
         timeout=str(_runtime.callee_silence_hangup_seconds),
         speech_timeout="auto",
         barge_in=True,
@@ -1007,25 +1196,54 @@ def hello_got_speech():
     return Response(str(vr), status=200, mimetype="text/xml")
 
 
-@app.route("/transcribe", methods=["POST"])
-def transcribe():
+@app.route("/dialog", methods=["POST"])
+def dialog():
+    """
+    Back-and-forth conversation loop. Each hit is one callee turn -> assistant reply,
+    then another gather until limit or silence timeout.
+    """
     if VoiceResponse is None:
         return Response("Server missing Twilio TwiML library.", status=500)
+    vr = VoiceResponse()
+
     call_sid = request.values.get("CallSid", "") or ""
     _set_current_call_sid(call_sid or _get_current_call_sid())
+
+    turn = _parse_int(request.args.get("turn"), 1)
     speech_text = (request.values.get("SpeechResult") or "").strip()
     if speech_text:
         _append_transcript(call_sid, "Callee", speech_text, is_final=True)
 
-    # Assistant responds with the next line from the dialog, then hang up
     params = _get_params_for_sid(call_sid)
-    dialog_lines = _get_dialog_lines(params.dialog_idx)
-    reply = dialog_lines[1] if len(dialog_lines) > 1 else "Goodbye."
-    _append_transcript(call_sid, "Assistant", reply, is_final=True)
+    # Assistant replies
+    reply_lines = _compose_assistant_reply(call_sid, turn)
+    for i, line in enumerate(reply_lines):
+        _append_transcript(call_sid, "Assistant", line, is_final=True)
+        vr.say(line, voice=params.voice, language=_runtime.tts_language)
+        if i < len(reply_lines) - 1:
+            vr.pause(length=1)
 
-    vr = VoiceResponse()
-    vr.say(reply, voice=params.voice, language=_runtime.tts_language)
-    vr.hangup()
+    # If we have remaining turns, gather again; else end.
+    if turn < _runtime.max_dialog_turns:
+        next_turn = turn + 1
+        g = Gather(
+            input="speech",
+            method="POST",
+            action=url_for("dialog", turn=next_turn, _external=True),
+            timeout=str(_runtime.callee_silence_hangup_seconds),
+            speech_timeout="auto",
+            barge_in=True,
+            partial_result_callback=url_for("transcribe_partial", stage="dialog", seq=next_turn, _external=True),
+            partial_result_callback_method="POST",
+            language=_runtime.tts_language,
+        )
+        vr.append(g)
+        vr.say("Goodbye.", voice=params.voice, language=_runtime.tts_language)
+        vr.hangup()
+    else:
+        vr.say("Goodbye.", voice=params.voice, language=_runtime.tts_language)
+        vr.hangup()
+
     return Response(str(vr), status=200, mimetype="text/xml")
 
 
@@ -1050,6 +1268,8 @@ def status_callback():
     answered_by = request.values.get("AnsweredBy") or ""
     sip_code = request.values.get("SipResponseCode") or ""
     duration = request.values.get("CallDuration") or ""
+    to_n = request.values.get("To") or ""
+    from_n = request.values.get("From") or ""
 
     logging.info(
         "Status cb: sid=%s status=%s answered_by=%s sip=%s duration=%s",
@@ -1065,13 +1285,52 @@ def status_callback():
     if call_status in ("initiated", "ringing", "in-progress", "answered"):
         if call_sid:
             _set_current_call_sid(call_sid)
+            _init_call_meta_if_absent(call_sid, to=to_n, from_n=from_n, started_at=now)
         _clear_outgoing_pending()
 
     if call_status == "completed":
         _set_current_call_sid(None)
         _clear_outgoing_pending()
+        dur_i = _parse_int(duration, 0)
+        with _CALL_META_LOCK:
+            meta = _CALL_META.setdefault(call_sid, {})
+            meta["completed_at"] = now
+            meta["duration_seconds"] = dur_i
+            cp = _CALL_PARAMS_BY_SID.get(call_sid)
+            if cp:
+                meta["voice"] = cp.voice
+                meta["dialog_idx"] = cp.dialog_idx
+        _persist_call_history(call_sid)
+        # Optionally prune in-memory transcript after persisting
+        with _TRANSCRIPTS_LOCK:
+            _TRANSCRIPTS.pop(call_sid, None)
         _reset_schedule_after_completion(now)
 
+    return ("", 204)
+
+
+@app.route("/recording-status", methods=["POST"])
+def recording_status():
+    """
+    Twilio recording status callback.
+    Use to track recording SIDs associated with a call for history playback.
+    """
+    call_sid = request.values.get("CallSid", "") or ""
+    rec_sid = request.values.get("RecordingSid", "") or ""
+    status = (request.values.get("RecordingStatus") or "").lower()
+    if call_sid and rec_sid:
+        with _CALL_META_LOCK:
+            meta = _CALL_META.setdefault(call_sid, {})
+            recs = meta.setdefault("recordings", [])
+            if status in ("in-progress", "completed"):
+                if not any(r.get("recording_sid") == rec_sid for r in recs):
+                    recs.append({"recording_sid": rec_sid, "status": status})
+            else:
+                # Update status if present
+                for r in recs:
+                    if r.get("recording_sid") == rec_sid:
+                        r["status"] = status
+                        break
     return ("", 204)
 
 
@@ -1188,7 +1447,6 @@ def _handle_termination(signum, frame):
         _stop_requested.set()
     except Exception:
         pass
-    # Give background threads a brief moment to exit, then terminate process
     try:
         time.sleep(0.5)
     except Exception:
@@ -1217,10 +1475,9 @@ def api_call_now():
     allowed, wait_s = _can_attempt(now, _runtime.to_number)
     if not allowed:
         return jsonify(ok=False, reason="cap_reached", wait_seconds=wait_s), 429
-    # If an actual call is in progress, block; pending alone should not block the request itself.
     if _get_current_call_sid() is not None:
         return jsonify(ok=False, reason="already_in_progress", message="A call is already in progress."), 409
-    _mark_outgoing_pending()  # reflect pending immediately to prevent scheduler overlap before callbacks
+    _mark_outgoing_pending()
     _manual_call_requested.set()
     return jsonify(ok=True)
 
@@ -1232,7 +1489,6 @@ def main():
     host = _runtime.flask_host or os.environ.get("FLASK_HOST", "0.0.0.0")
     port = int(_runtime.flask_port or _parse_int(os.environ.get("FLASK_PORT"), 8080))
     debug = bool(_runtime.flask_debug or _parse_bool(os.environ.get("FLASK_DEBUG"), False))
-    # use_reloader=False prevents duplicate processes that ignore signals
     app.run(host=host, port=port, debug=debug, use_reloader=False)
 
 
