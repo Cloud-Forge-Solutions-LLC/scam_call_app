@@ -302,12 +302,10 @@
   }
 
   // -----------------------
-  // Status poller and UI (countdown + labels + stats)
+  // Status poller and UI (countdown + labels)
   // -----------------------
   let statusTimer = null;
-  let callActive = false;
-  let autoListenEnabled = false;
-  let listenWasActiveOnLastCall = false;
+  let callActive = false; // Tracks in-progress state when provided by backend
 
   function renderNumbersLine(data) {
     const to = data.to_number || "";
@@ -404,22 +402,6 @@
         ${renderNumbersLine(data)}
       </div>`;
 
-    // Add right-side stats graphic
-    let statsGraphic = qs("#statsGraphic");
-    if (!statsGraphic) {
-      statsGraphic = document.createElement("div");
-      statsGraphic.id = "statsGraphic";
-      statsGraphic.style.cssText = "flex:0 0 290px; margin-left:2rem;";
-      area.parentNode.insertBefore(statsGraphic, area.nextSibling);
-    }
-    area.style.display = "flex";
-    area.style.flexDirection = "row";
-    area.style.alignItems = "flex-start";
-    statsGraphic.style.display = "block";
-    if (window.callStats && window.callStats.fetchAndRenderStats) {
-      window.callStats.fetchAndRenderStats();
-    }
-
     const focal =
       `<div style="display:flex;align-items:center;gap:1rem;margin-top:.9rem">
         <div style="flex:0 0 auto">${svg}</div>
@@ -454,15 +436,12 @@
     document.addEventListener("visibilitychange", () => {
       if (!document.hidden) pollStatusOnce();
     });
-    // Initial stats fetch
-    if (window.callStats && window.callStats.fetchAndRenderStats) {
-      window.callStats.fetchAndRenderStats();
-    }
   }
 
   // -----------------------
   // Live conversation UI (transcript + optional audio listen)
   // -----------------------
+  // Style for live panel visuals
   (function ensureLivePanelStyle() {
     const id = "live-convo-style";
     if (qs(`#${id}`)) return;
@@ -522,7 +501,7 @@
       <div class="panel-header" style="display:flex;justify-content:space-between;align-items:center;gap:1rem">
         <h2 class="panel-title">Live Conversation</h2>
         <div style="display:flex;align-items:center;gap:.5rem">
-          <button id="btnListenLive" class="btn" disabled>Listen live (toggle on)</button>
+          <button id="btnListenLive" class="btn" disabled>Listen live</button>
           <span id="listenStatus" class="muted" aria-live="polite"></span>
         </div>
       </div>
@@ -605,12 +584,12 @@
   function initLivePanel() {
     const panel = ensureLivePanel();
     const btn = qs("#btnListenLive", panel);
-    btn.addEventListener("click", toggleListenLive);
+    btn?.addEventListener("click", () => {
+      if (ws) stopListening();
+      else startListening();
+    });
     clearInterval(liveTimer);
-    liveTimer = setInterval(() => {
-      pollLiveTranscript();
-      autoListenHandler(callActive);
-    }, 1000);
+    liveTimer = setInterval(pollLiveTranscript, 1000);
     pollLiveTranscript();
   }
 
@@ -684,13 +663,6 @@
     return 1.0;
   }
 
-  function updateListenLiveButton(state) {
-    const btn = qs("#btnListenLive");
-    if (!btn) return;
-    btn.textContent = state ? "Listening (toggle off)" : "Listen live (toggle on)";
-    btn.classList.toggle("active", !!state);
-  }
-
   async function startListening() {
     const status = qs("#listenStatus");
     const btn = qs("#btnListenLive");
@@ -736,13 +708,15 @@
 
       const scheme = location.protocol === "https:" ? "wss" : "ws";
       ws = new WebSocket(`${scheme}://${location.host}/client-audio`);
+      // Accept both string (base64) and binary frames
       try { ws.binaryType = "arraybuffer"; } catch {}
 
       ws.onopen = async () => {
         lastBufferSamples = 0;
         if (!workletLoaded) {
+          // Fallback to ScriptProcessor with smaller buffer to reduce latency
           if (!scriptNode) {
-            const bufSize = 1024;
+            const bufSize = 1024; // lower than 4096 to reduce lag
             scriptNode = audioCtx.createScriptProcessor(bufSize, 0, 1);
             scriptNode.onaudioprocess = audioProcess;
             scriptNode.connect(audioCtx.destination);
@@ -750,8 +724,7 @@
           playing = true;
         }
         if (status) status.textContent = "Connected";
-        updateListenLiveButton(true);
-        listenWasActiveOnLastCall = true;
+        if (btn) btn.textContent = "Stop listening";
       };
 
       ws.onmessage = (ev) => {
@@ -759,8 +732,11 @@
           let pcm8k = null;
 
           if (ev.data instanceof ArrayBuffer) {
+            // Binary μ-law payload (optional future server optimization)
             pcm8k = decodeMuLawBytesToFloat32(new Uint8Array(ev.data));
           } else if (typeof ev.data === "string") {
+            // Maintain compatibility with current server (base64 μ-law payload string)
+            // Also accept JSON if server later forwards full Twilio media envelope
             if (ev.data.length > 0 && ev.data[0] === "{") {
               try {
                 const obj = JSON.parse(ev.data);
@@ -771,6 +747,7 @@
                   return;
                 }
               } catch {
+                // Fallback assume raw base64 string
                 pcm8k = decodeMuLawToFloat32(ev.data);
               }
             } else {
@@ -786,20 +763,22 @@
           const pcm = resampleToContextRate(pcm8k, audioCtx.sampleRate, ratioAdjust);
 
           if (playerNode) {
+            // Transfer the underlying buffer to the worklet to minimize copies
             if (pcm && pcm.buffer) {
               playerNode.port.postMessage({ type: "push", pcm: pcm.buffer }, [pcm.buffer]);
             }
           } else {
+            // Legacy fallback path
             audioQueue.push(pcm);
           }
         } catch {
+          // ignore malformed frames
         }
       };
 
       ws.onclose = () => {
         if (status) status.textContent = "Disconnected";
-        updateListenLiveButton(false);
-        listenWasActiveOnLastCall = false;
+        if (btn) btn.textContent = "Listen live";
         if (!workletLoaded) {
           playing = false;
         } else if (playerGain && audioCtx) {
@@ -813,16 +792,16 @@
 
       ws.onerror = () => {
         if (status) status.textContent = "Audio error";
-        updateListenLiveButton(false);
-        listenWasActiveOnLastCall = false;
+        if (btn) btn.textContent = "Listen live";
         try { ws && ws.close(); } catch {}
         ws = null;
         if (!workletLoaded) playing = false;
       };
     } catch {
       const status = qs("#listenStatus");
-      updateListenLiveButton(false);
-      listenWasActiveOnLastCall = false;
+      const btn = qs("#btnListenLive");
+      if (status) status.textContent = "Audio not available";
+      if (btn) btn.textContent = "Listen live";
       ws = null;
     }
   }
@@ -841,24 +820,7 @@
       playerGain.gain.linearRampToValueAtTime(0.0, t + 0.05);
     }
     if (status) status.textContent = "Stopped";
-    updateListenLiveButton(false);
-    listenWasActiveOnLastCall = false;
-  }
-
-  function toggleListenLive() {
-    autoListenEnabled = !autoListenEnabled;
-    updateListenLiveButton(autoListenEnabled);
-    if (!autoListenEnabled) {
-      stopListening();
-    }
-  }
-
-  function autoListenHandler(callInProgress) {
-    if (autoListenEnabled && callInProgress && !listenWasActiveOnLastCall) {
-      startListening();
-    } else if (!callInProgress && listenWasActiveOnLastCall) {
-      stopListening();
-    }
+    if (btn) btn.textContent = "Listen live";
   }
 
   document.addEventListener("visibilitychange", () => {
@@ -874,8 +836,5 @@
     initAdminPanel();
     initStatusPoll();
     initLivePanel();
-    if (window.callStats && window.callStats.fetchAndRenderStats) {
-      window.callStats.fetchAndRenderStats();
-    }
   });
 })();
