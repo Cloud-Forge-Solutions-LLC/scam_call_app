@@ -9,6 +9,12 @@ Updates in this version:
 - Alternating voice per call: Switches assistant TTS voice between male and female every other call.
 - Rotating dialog: Each call uses a different dialog set (will cycle through the list).
 - Dialogs may include harsh language as requested.
+
+Bug fixes in this version:
+- Manual-call suppression: Manual calls were being suppressed as "busy" due to a pre-set pending flag.
+  The manual path now only blocks when an actual call SID is active.
+- UI accuracy: The status and live endpoints now report "in progress" only when a real CallSid is active,
+  not merely pending, so the UI no longer shows a call in progress when none has started yet.
 """
 
 from __future__ import annotations
@@ -634,7 +640,8 @@ def _dialer_loop() -> None:
         if _manual_call_requested.is_set():
             _manual_call_requested.clear()
             if _runtime.to_number:
-                if not _is_call_busy() and _within_active_window(_now_local()):
+                # Only consider "busy" when there is an actual active CallSid; ignore "pending" for manual path
+                if (_get_current_call_sid() is None) and _within_active_window(_now_local()):
                     can, wait_s = _can_attempt(now, _runtime.to_number)
                     if can:
                         ok = _place_call_now()
@@ -783,9 +790,11 @@ def api_status():
         interval_start = _interval_start_epoch_s
         interval_total = _interval_total_seconds
 
-    pending = _is_outgoing_pending()
+    # Compute both pending and active, but expose "call_in_progress" only for a real active CallSid.
+    # This keeps the UI accurate: it should not show "active call" when we are merely pending.
+    _ = _is_outgoing_pending()  # retained for potential internal diagnostics
     active_sid = _get_current_call_sid()
-    call_in_progress = bool(pending or active_sid)
+    call_in_progress = bool(active_sid)
 
     within = _within_active_window(_now_local())
     to = _runtime.to_number
@@ -842,7 +851,8 @@ def api_live_transcript():
         transcript = list(_TRANSCRIPTS.get(sid or "", [])) if sid else []
     return jsonify({
         "ok": True,
-        "in_progress": bool(sid or _is_outgoing_pending()),
+        # Report in_progress only on an actual CallSid (not on "pending") to keep UI accurate.
+        "in_progress": bool(sid),
         "callSid": sid or "",
         "transcript": transcript,
         "media_streams_enabled": bool(_runtime.enable_media_streams),
@@ -1207,9 +1217,10 @@ def api_call_now():
     allowed, wait_s = _can_attempt(now, _runtime.to_number)
     if not allowed:
         return jsonify(ok=False, reason="cap_reached", wait_seconds=wait_s), 429
-    if _is_call_busy():
+    # If an actual call is in progress, block; pending alone should not block the request itself.
+    if _get_current_call_sid() is not None:
         return jsonify(ok=False, reason="already_in_progress", message="A call is already in progress."), 409
-    _mark_outgoing_pending()  # reflect pending immediately to UI and prevent overlap before callbacks
+    _mark_outgoing_pending()  # reflect pending immediately to prevent scheduler overlap before callbacks
     _manual_call_requested.set()
     return jsonify(ok=True)
 
