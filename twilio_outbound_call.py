@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
 """
 Scam Call Console: Outbound caller service with admin UI, pacing, Twilio voice,
-optional Media Streams, live transcript API, call history, and clean shutdown.
+optional Media Streams, live transcript API, and clean shutdown.
+
+Updates in this version:
+- Graceful termination: Ctrl+C (SIGINT) and SIGTERM now stop the server and background threads cleanly.
+- Wait-to-speak: Wait for the callee to speak first before the assistant starts talking.
+- Alternating voice per call: Switches assistant TTS voice between male and female every other call.
+- Rotating dialog: Each call uses a different dialog set (will cycle through the list).
+- Dialogs may include harsh language as requested.
 """
 
 from __future__ import annotations
@@ -29,8 +36,6 @@ from flask import (
     request,
     session,
     url_for,
-    send_file,
-    abort,
 )
 from werkzeug.middleware.proxy_fix import ProxyFix
 
@@ -59,12 +64,6 @@ try:
     from pyngrok import ngrok as ngrok_lib  # type: ignore
 except Exception:
     ngrok_lib = None  # type: ignore
-
-# Optional requests for recording proxy
-try:
-    import requests  # type: ignore
-except Exception:
-    requests = None  # type: ignore
 
 # Optional WebSocket support for Media Streams
 _sock = None
@@ -172,7 +171,7 @@ class RuntimeConfig:
 
     callee_silence_hangup_seconds: int = 8
 
-    recording_mode: str = "off"  # "off" or "on"
+    recording_mode: str = "off"
     recording_jurisdiction_mode: str = "disable_in_two_party"
 
     public_base_url: Optional[str] = None
@@ -185,18 +184,6 @@ class RuntimeConfig:
 
 
 _runtime = RuntimeConfig()
-
-# Parser warnings to surface in /api/status
-_PARSE_WARNINGS_LOCK = threading.Lock()
-_PARSE_WARNINGS: List[str] = []
-
-
-def _add_parse_warning(msg: str) -> None:
-    with _PARSE_WARNINGS_LOCK:
-        # keep last 10
-        _PARSE_WARNINGS.append(msg)
-        if len(_PARSE_WARNINGS) > 10:
-            del _PARSE_WARNINGS[: len(_PARSE_WARNINGS) - 10]
 
 
 def _normalize_day_name(s: str) -> Optional[str]:
@@ -303,44 +290,86 @@ _SECRET_ENV_KEYS = {
     "FLASK_SECRET",
 }
 
-# Persisted call storage
-DATA_DIR = Path("data")
-CALLS_DIR = DATA_DIR / "calls"
-CALLS_DIR.mkdir(parents=True, exist_ok=True)
 
-
-def _call_file(sid: str) -> Path:
-    return CALLS_DIR / f"{sid}.json"
-
-
-def _write_call_json(sid: str, obj: Dict[str, Any]) -> None:
+def _current_env_editable_pairs() -> List[Tuple[str, str]]:
+    effective: Dict[str, str] = {}
+    for k in _EDITABLE_ENV_KEYS:
+        effective[k] = (os.environ.get(k) or "").strip()
     try:
-        tmp = _call_file(sid).with_suffix(".json.tmp")
-        with tmp.open("w", encoding="utf-8") as f:
-            json.dump(obj, f, ensure_ascii=False, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, _call_file(sid))
-    except Exception as e:
-        logging.error("Failed to write call file %s: %s", sid, e)
+        env_path = Path(".env")
+        if env_path.exists():
+            for k, v in _load_dotenv_pairs(str(env_path)):
+                if k in _EDITABLE_ENV_KEYS:
+                    effective[k] = (v or "").strip()
+    except Exception:
+        pass
+    return [(k, effective.get(k, "")) for k in _EDITABLE_ENV_KEYS]
 
 
-def _read_call_json(sid: str) -> Optional[Dict[str, Any]]:
-    p = _call_file(sid)
+def _load_dotenv_for_write() -> List[str]:
+    p = Path(".env")
+    if not p.exists():
+        return []
     try:
-        if p.exists():
-            with p.open("r", encoding="utf-8") as f:
-                return json.load(f)
-    except Exception as e:
-        logging.error("Failed to read call file %s: %s", sid, e)
-    return None
-
-
-def _list_call_files() -> List[str]:
-    try:
-        return sorted([p.stem for p in CALLS_DIR.glob("*.json")], reverse=True)
+        with p.open("r", encoding="utf-8") as f:
+            return f.readlines()
     except Exception:
         return []
+
+
+def _write_env_updates_preserving_comments(updates: Dict[str, str]) -> None:
+    env_path = Path(".env")
+    try:
+        lines = _load_dotenv_for_write()
+        key_to_idx: Dict[str, int] = {}
+        for idx, raw in enumerate(lines):
+            s = raw.strip()
+            if not s or s.startswith("#"):
+                continue
+            eq = s.find("=")
+            if eq <= 0:
+                continue
+            k = s[:eq].strip()
+            if k in _EDITABLE_ENV_KEYS:
+                key_to_idx[k] = idx
+        content = list(lines)
+        for k, v in updates.items():
+            if k not in _EDITABLE_ENV_KEYS:
+                continue
+            safe_v = "" if v is None else str(v)
+            new_line = f"{k}={safe_v}\n"
+            if k in key_to_idx:
+                content[key_to_idx[k]] = new_line
+            else:
+                if content and not content[-1].endswith("\n"):
+                    content[-1] = content[-1] + "\n"
+                content.append(new_line)
+        tmp = env_path.with_suffix(".tmp")
+        bak = env_path.with_suffix(".bak")
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.writelines(content)
+            f.flush()
+        try:
+            if env_path.exists():
+                if bak.exists():
+                    try:
+                        bak.unlink()
+                    except Exception:
+                        pass
+                env_path.replace(bak)
+        except Exception:
+            pass
+        os.replace(tmp, env_path)
+    except Exception as e:
+        logging.error("Failed writing .env: %s", e)
+
+
+def _apply_env_updates(updates: Dict[str, str]) -> None:
+    _write_env_updates_preserving_comments(updates)
+    for k, v in updates.items():
+        if k in _EDITABLE_ENV_KEYS and k not in _SECRET_ENV_KEYS:
+            os.environ[k] = "" if v is None else str(v)
+    _load_runtime_from_env()
 
 
 # Attempt pacing
@@ -364,78 +393,13 @@ def _note_attempt(now_ts: float, to_number: str) -> None:
         _dest_attempts.setdefault(to_number, []).append(now_ts)
 
 
-def _parse_time_component(part: str, label: str) -> Optional[Tuple[int, int]]:
-    s = (part or "").strip()
-    if not s:
-        _add_parse_warning(f"Empty {label} time component.")
-        return None
-    # Exact HH:MM
-    m = re.match(r"^\s*(\d{1,2}):(\d{2})\s*$", s)
-    if m:
-        h = int(m.group(1))
-        mnt = int(m.group(2))
-        if 0 <= h <= 23 and 0 <= mnt <= 59:
-            return h, mnt
-        _add_parse_warning(f"{label} out of range: {s}")
-        return None
-    # Digits only like 800 or 1500 or 8
-    digits = "".join(re.findall(r"\d", s))
-    if digits:
-        if len(digits) == 4:
-            h = int(digits[:2])
-            mnt = int(digits[2:])
-            if 0 <= h <= 23 and 0 <= mnt <= 59:
-                return h, mnt
-        elif len(digits) == 3:
-            h = int(digits[:1])
-            mnt = int(digits[1:])
-            if 0 <= h <= 23 and 0 <= mnt <= 59:
-                return h, mnt
-        elif len(digits) == 2:
-            h = int(digits)
-            if 0 <= h <= 23:
-                return h, 0
-        elif len(digits) == 1:
-            h = int(digits)
-            if 0 <= h <= 9:
-                return h, 0
-    # Special case like ":1500" or "1500:" -> use the digits
-    if re.search(r":\s*\d{3,4}$", s) or re.search(r"^\s*\d{3,4}\s*:$", s):
-        digits = "".join(re.findall(r"\d", s))
-        if len(digits) in (3, 4):
-            if len(digits) == 4:
-                h = int(digits[:2])
-                mnt = int(digits[2:])
-            else:
-                h = int(digits[:1])
-                mnt = int(digits[1:])
-            if 0 <= h <= 23 and 0 <= mnt <= 59:
-                return h, mnt
-    _add_parse_warning(f"Unrecognized {label} time component: {s}")
-    return None
-
-
-def _parse_hours_range(range_str: str) -> Optional[Tuple[int, int, int, int]]:
-    if not range_str or "-" not in range_str:
-        _add_parse_warning(f"ACTIVE_HOURS_LOCAL missing '-' separator: {range_str}")
-        return None
-    start_str, end_str = range_str.split("-", 1)
-    start = _parse_time_component(start_str, "start")
-    end = _parse_time_component(end_str, "end")
-    if start is None or end is None:
-        return None
-    sh, sm = start
-    eh, em = end
-    return sh, sm, eh, em
-
-
 def _within_active_window(now_local: datetime) -> bool:
-    parsed = _parse_hours_range(_runtime.active_hours_local or "09:00-18:00")
-    if parsed is None:
-        # Fallback but flag a warning
+    try:
+        start_str, end_str = (_runtime.active_hours_local or "09:00-18:00").split("-", 1)
+        sh, sm = [int(x) for x in start_str.split(":")]
+        eh, em = [int(x) for x in end_str.split(":")]
+    except Exception:
         sh, sm, eh, em = 9, 0, 18, 0
-    else:
-        sh, sm, eh, em = parsed
     wd_map = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
     today = wd_map[now_local.weekday()]
     if _runtime.active_days and today not in _runtime.active_days:
@@ -445,7 +409,6 @@ def _within_active_window(now_local: datetime) -> bool:
     end_m = eh * 60 + em
     if start_m <= end_m:
         return start_m <= t_minutes <= end_m
-    # Overnight window
     return t_minutes >= start_m or t_minutes <= end_m
 
 
@@ -556,11 +519,12 @@ class CallParams:
     dialog_idx: int
 
 
+# Dialog sets. These rotate each call (mild harsh language by request).
 _DIALOGS: List[List[str]] = [
     ["Where is my refund?", "Stop wasting my time."],
     ["Do not stall me.", "Answer the question now."],
     ["Cut the nonsense.", "I am not playing games."],
-    ["You are not prepared.", "Resolve this immediately."],
+    ["You clearly are not prepared.", "Get this together now."],
     ["I expect clear answers.", "Do not try to dodge this."],
     ["Enough delays.", "Be direct with me."],
 ]
@@ -576,7 +540,7 @@ def _select_next_call_params() -> CallParams:
     global _PLACED_CALL_COUNT, _LAST_DIALOG_IDX
     with _PARAMS_LOCK:
         _PLACED_CALL_COUNT += 1
-        voice = "man" if (_PLACED_CALL_COUNT % 2 == 1) else "woman"
+        voice = "man" if (_PLACED_CALL_COUNT % 2 == 1) else "woman"  # alternate voice each call
         _LAST_DIALOG_IDX = (_LAST_DIALOG_IDX + 1) % max(1, len(_DIALOGS))
         return CallParams(voice=voice, dialog_idx=_LAST_DIALOG_IDX)
 
@@ -616,7 +580,7 @@ def _place_call_now() -> bool:
     """
     Attempt to place a call once, returning True if Twilio accepted the request.
     Sets 'outgoing pending' immediately to prevent duplicates before callbacks.
-    Also preselects voice/dialog for the call and enables recording if configured.
+    Also preselects voice/dialog for the call.
     """
     client = _ensure_twilio_client()
     from_n = _choose_from_number()
@@ -625,17 +589,14 @@ def _place_call_now() -> bool:
         return False
     try:
         _prepare_params_for_next_call()
-        kwargs: Dict[str, Any] = {
-            "to": _runtime.to_number,
-            "from_": from_n,
-            "url": f"{public_url}/voice",
-            "status_callback": f"{public_url}/status",
-            "status_callback_event": ["initiated", "ringing", "answered", "completed"],
-            "status_callback_method": "POST",
-        }
-        if _runtime.recording_mode != "off":
-            kwargs["record"] = True  # Start call recording
-        call = client.calls.create(**kwargs)
+        call = client.calls.create(
+            to=_runtime.to_number,
+            from_=from_n,
+            url=f"{public_url}/voice",
+            status_callback=f"{public_url}/status",
+            status_callback_event=["initiated", "ringing", "answered", "completed"],
+            status_callback_method="POST",
+        )
         logging.info("Placed call: %s", getattr(call, "sid", "<sid>"))
         _note_attempt(time.time(), _runtime.to_number)
         _mark_outgoing_pending()
@@ -698,7 +659,7 @@ def _dialer_loop() -> None:
             else:
                 _reset_schedule_after_completion(now)
 
-        # Sleep brief
+        # Sleep in short steps for responsiveness on shutdown
         for _ in range(5):
             if _stop_requested.is_set():
                 break
@@ -707,12 +668,9 @@ def _dialer_loop() -> None:
     logging.info("Dialer thread stopped.")
 
 
-# Transcripts and metadata
+# Transcripts
 _TRANSCRIPTS_LOCK = threading.Lock()
 _TRANSCRIPTS: Dict[str, List[Dict[str, Any]]] = {}
-
-_CALL_META_LOCK = threading.Lock()
-_CALL_META: Dict[str, Dict[str, Any]] = {}  # sid -> meta
 
 
 def _append_transcript(call_sid: str, role: str, text: str, is_final: bool) -> None:
@@ -721,75 +679,6 @@ def _append_transcript(call_sid: str, role: str, text: str, is_final: bool) -> N
     entry = {"t": time.time(), "role": role, "text": text, "final": bool(is_final)}
     with _TRANSCRIPTS_LOCK:
         _TRANSCRIPTS.setdefault(call_sid, []).append(entry)
-    # Persist a snapshot
-    _persist_call_snapshot(call_sid)
-
-
-def _init_call_meta_from_request(call_sid: str) -> None:
-    if not call_sid:
-        return
-    with _CALL_META_LOCK:
-        meta = _CALL_META.get(call_sid, {})
-        meta.setdefault("sid", call_sid)
-        meta.setdefault("to", request.values.get("To", _runtime.to_number))
-        meta.setdefault("from", request.values.get("From", _runtime.from_number))
-        meta.setdefault("started_at", time.time())
-        meta.setdefault("completed_at", None)
-        meta.setdefault("recordings", [])
-        params = _get_params_for_sid(call_sid)
-        meta.setdefault("voice", params.voice)
-        meta.setdefault("dialog_idx", params.dialog_idx)
-        _CALL_META[call_sid] = meta
-    _persist_call_snapshot(call_sid)
-
-
-def _persist_call_snapshot(call_sid: str) -> None:
-    if not call_sid:
-        return
-    with _CALL_META_LOCK:
-        meta = dict(_CALL_META.get(call_sid, {}))
-    with _TRANSCRIPTS_LOCK:
-        tx = list(_TRANSCRIPTS.get(call_sid, []))
-    obj = {
-        "sid": call_sid,
-        "meta": meta,
-        "transcript": tx,
-    }
-    _write_call_json(call_sid, obj)
-
-
-def _finalize_call_with_recordings(call_sid: str) -> None:
-    # Fetch recordings and update file
-    try:
-        client = _ensure_twilio_client()
-        recs: List[Dict[str, Any]] = []
-        if client is not None:
-            try:
-                # Twilio Python client uses call_sid param
-                for r in client.recordings.list(call_sid=call_sid):
-                    # Build an mp3 media URL
-                    # r.uri typically like /2010-04-01/Accounts/AC.../Recordings/RE....json
-                    uri = getattr(r, "uri", "")
-                    mp3_url = None
-                    if uri:
-                        mp3_url = f"https://api.twilio.com{uri}".replace(".json", ".mp3")
-                    recs.append(
-                        {
-                            "recording_sid": r.sid,
-                            "duration": getattr(r, "duration", ""),
-                            "media_mp3_url": mp3_url,
-                        }
-                    )
-            except Exception as e:
-                logging.warning("Failed to list recordings for %s: %s", call_sid, e)
-        with _CALL_META_LOCK:
-            meta = _CALL_META.get(call_sid, {})
-            meta["recordings"] = recs
-            meta["completed_at"] = meta.get("completed_at") or time.time()
-            _CALL_META[call_sid] = meta
-        _persist_call_snapshot(call_sid)
-    except Exception as e:
-        logging.error("Failed to finalize call %s with recordings: %s", call_sid, e)
 
 
 # UI routes
@@ -801,11 +690,6 @@ def root():
 @app.route("/scamcalls", methods=["GET"])
 def scamcalls():
     return render_template("scamcalls.html", is_admin=_admin_authenticated())
-
-
-@app.route("/scamcalls/history", methods=["GET"])
-def scamcalls_history():
-    return render_template("history.html", is_admin=_admin_authenticated())
 
 
 # Admin auth
@@ -863,10 +747,7 @@ def api_admin_env_get():
     resp = _require_admin_for_api()
     if resp:
         return resp
-    # Return current editable envs
-    editable: List[Dict[str, str]] = []
-    for k in _EDITABLE_ENV_KEYS:
-        editable.append({"key": k, "value": (os.environ.get(k) or "")})
+    editable = [{"key": k, "value": v} for (k, v) in _current_env_editable_pairs()]
     return jsonify({"editable": editable})
 
 
@@ -886,72 +767,11 @@ def api_admin_env_post():
                 continue
             if k in _EDITABLE_ENV_KEYS:
                 clean_updates[str(k)] = "" if v is None else str(v)
-        # Persist updates into .env
-        _write_env_updates_preserving_comments(clean_updates)
-        # Apply to process
-        for k, v in clean_updates.items():
-            os.environ[k] = v
-        # Reload runtime
-        _load_runtime_from_env()
+        _apply_env_updates(clean_updates)
         return jsonify({"ok": True})
     except Exception as e:
         logging.error("Failed to save env updates: %s", e)
         return Response("Failed to save settings.", status=500)
-
-
-def _load_dotenv_for_write() -> List[str]:
-    p = Path(".env")
-    if not p.exists():
-        return []
-    try:
-        with p.open("r", encoding="utf-8") as f:
-            return f.readlines()
-    except Exception:
-        return []
-
-
-def _write_env_updates_preserving_comments(updates: Dict[str, str]) -> None:
-    env_path = Path(".env")
-    lines = _load_dotenv_for_write()
-    key_to_idx: Dict[str, int] = {}
-    for idx, raw in enumerate(lines):
-        s = raw.strip()
-        if not s or s.startswith("#"):
-            continue
-        eq = s.find("=")
-        if eq <= 0:
-            continue
-        k = s[:eq].strip()
-        if k in _EDITABLE_ENV_KEYS:
-            key_to_idx[k] = idx
-    content = list(lines)
-    for k, v in updates.items():
-        if k not in _EDITABLE_ENV_KEYS:
-            continue
-        safe_v = "" if v is None else str(v)
-        new_line = f"{k}={safe_v}\n"
-        if k in key_to_idx:
-            content[key_to_idx[k]] = new_line
-        else:
-            if content and not content[-1].endswith("\n"):
-                content[-1] = content[-1] + "\n"
-            content.append(new_line)
-    tmp = env_path.with_suffix(".tmp")
-    bak = env_path.with_suffix(".bak")
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.writelines(content)
-        f.flush()
-    try:
-        if env_path.exists():
-            if bak.exists():
-                try:
-                    bak.unlink()
-                except Exception:
-                    pass
-            env_path.replace(bak)
-    except Exception:
-        pass
-    os.replace(tmp, env_path)
 
 
 # Status API
@@ -989,9 +809,6 @@ def api_status():
     if interval_start is not None and interval_total is not None:
         interval_elapsed = None if call_in_progress else max(0, now_i - interval_start)
 
-    with _PARSE_WARNINGS_LOCK:
-        parse_warnings = list(_PARSE_WARNINGS)
-
     payload = {
         "now_epoch": now_i,
         "next_call_epoch": next_epoch,
@@ -1013,68 +830,23 @@ def api_status():
         "call_in_progress": call_in_progress,
         "media_streams_enabled": bool(_runtime.enable_media_streams),
         "public_base_url": _runtime.public_base_url or "",
-        "parse_warnings": parse_warnings,
     }
     return jsonify(payload)
 
 
-# History APIs
-@app.route("/api/history", methods=["GET"])
-def api_history_list():
-    # No auth required for now; add admin if desired
-    sids = _list_call_files()
-    items: List[Dict[str, Any]] = []
-    for sid in sids:
-        obj = _read_call_json(sid)
-        if not obj:
-            continue
-        meta = obj.get("meta", {})
-        started = meta.get("started_at")
-        completed = meta.get("completed_at")
-        duration = None
-        if isinstance(started, (int, float)) and isinstance(completed, (int, float)):
-            duration = max(0, int(completed - started))
-        items.append({
-            "sid": sid,
-            "to": meta.get("to", ""),
-            "from": meta.get("from", ""),
-            "started_at": started,
-            "completed_at": completed,
-            "duration_seconds": duration,
-            "has_recordings": bool(meta.get("recordings")),
-            "voice": meta.get("voice"),
-            "dialog_idx": meta.get("dialog_idx"),
-        })
-    return jsonify({"calls": items})
-
-
-@app.route("/api/history/<sid>", methods=["GET"])
-def api_history_detail(sid: str):
-    obj = _read_call_json(sid)
-    if not obj:
-        return jsonify({"error": "not_found"}), 404
-    return jsonify(obj)
-
-
-@app.route("/api/recording/<rec_sid>", methods=["GET"])
-def api_recording_proxy(rec_sid: str):
-    if requests is None:
-        return jsonify({"error": "requests_not_installed"}), 501
-    client = _ensure_twilio_client()
-    if client is None:
-        return jsonify({"error": "twilio_not_configured"}), 500
-    try:
-        # Construct mp3 URL
-        mp3_url = f"https://api.twilio.com/2010-04-01/Accounts/{client.username}/Recordings/{rec_sid}.mp3"
-        auth = (client.username, client.password)  # type: ignore
-        r = requests.get(mp3_url, auth=auth, stream=True)
-        if r.status_code != 200:
-            return jsonify({"error": "fetch_failed", "status": r.status_code}), 502
-        # Stream to client
-        return Response(r.iter_content(chunk_size=8192), content_type="audio/mpeg")
-    except Exception as e:
-        logging.error("Recording proxy error for %s: %s", rec_sid, e)
-        return jsonify({"error": "exception"}), 500
+# Live transcript API
+@app.route("/api/live", methods=["GET"])
+def api_live_transcript():
+    sid = _get_current_call_sid()
+    with _TRANSCRIPTS_LOCK:
+        transcript = list(_TRANSCRIPTS.get(sid or "", [])) if sid else []
+    return jsonify({
+        "ok": True,
+        "in_progress": bool(sid or _is_outgoing_pending()),
+        "callSid": sid or "",
+        "transcript": transcript,
+        "media_streams_enabled": bool(_runtime.enable_media_streams),
+    })
 
 
 # One-shot greeting setter
@@ -1107,6 +879,11 @@ def api_next_greeting():
 
 
 def _build_opening_lines_for_sid(call_sid: str) -> List[str]:
+    """
+    Build opening lines for this call. If a one-shot greeting is present, use that.
+    Otherwise, use the first line from the selected dialog for this call.
+    Optionally append company/topic context.
+    """
     one = _pop_one_shot_opening()
     if one:
         lines = [one]
@@ -1115,6 +892,7 @@ def _build_opening_lines_for_sid(call_sid: str) -> List[str]:
         base_dialog = _get_dialog_lines(params.dialog_idx)
         first = base_dialog[0] if base_dialog else "Hello."
         lines = [first]
+    # Optional context additions
     if _runtime.company_name:
         lines.append(f"This is {_runtime.company_name}.")
     if _runtime.topic:
@@ -1138,7 +916,6 @@ def voice_entrypoint():
         _set_current_call_sid(call_sid)
         _clear_outgoing_pending()
         _assign_params_to_sid(call_sid)
-        _init_call_meta_from_request(call_sid)
 
     # Optional Media Streams
     if _runtime.enable_media_streams and Start is not None and Stream is not None and _runtime.public_base_url:
@@ -1163,7 +940,10 @@ def voice_entrypoint():
         partial_result_callback_method="POST",
         language=_runtime.tts_language,
     )
+    # No initial speech from assistant; we are waiting for the callee
     vr.append(g)
+
+    # In case the gather times out and Twilio falls through, provide a fallback redirect to action
     vr.redirect(url_for("hello_got_speech", _external=True), method="POST")
     return Response(str(vr), status=200, mimetype="text/xml")
 
@@ -1183,12 +963,13 @@ def hello_got_speech():
         _set_current_call_sid(call_sid)
         _clear_outgoing_pending()
         _assign_params_to_sid(call_sid)
-        _init_call_meta_from_request(call_sid)
 
+    # Record what callee said (if any)
     speech_text = (request.values.get("SpeechResult") or "").strip()
     if speech_text:
         _append_transcript(call_sid, "Callee", speech_text, is_final=True)
 
+    # Assistant speaks opening lines now
     params = _get_params_for_sid(call_sid)
     opening_lines = _build_opening_lines_for_sid(call_sid)
     for i, line in enumerate(opening_lines):
@@ -1197,6 +978,7 @@ def hello_got_speech():
         if i < len(opening_lines) - 1:
             vr.pause(length=1)
 
+    # Now listen again for callee's response and continue in /transcribe
     g = Gather(
         input="speech",
         method="POST",
@@ -1209,6 +991,7 @@ def hello_got_speech():
         language=_runtime.tts_language,
     )
     vr.append(g)
+    # If no response, politely end the call
     vr.say("Goodbye.", voice=params.voice, language=_runtime.tts_language)
     vr.hangup()
     return Response(str(vr), status=200, mimetype="text/xml")
@@ -1220,11 +1003,11 @@ def transcribe():
         return Response("Server missing Twilio TwiML library.", status=500)
     call_sid = request.values.get("CallSid", "") or ""
     _set_current_call_sid(call_sid or _get_current_call_sid())
-    _init_call_meta_from_request(call_sid)
     speech_text = (request.values.get("SpeechResult") or "").strip()
     if speech_text:
         _append_transcript(call_sid, "Callee", speech_text, is_final=True)
 
+    # Assistant responds with the next line from the dialog, then hang up
     params = _get_params_for_sid(call_sid)
     dialog_lines = _get_dialog_lines(params.dialog_idx)
     reply = dialog_lines[1] if len(dialog_lines) > 1 else "Goodbye."
@@ -1240,7 +1023,6 @@ def transcribe():
 def transcribe_partial():
     call_sid = request.values.get("CallSid", "") or ""
     _set_current_call_sid(call_sid or _get_current_call_sid())
-    _init_call_meta_from_request(call_sid)
     part = (request.values.get("UnstableSpeechResult") or request.values.get("SpeechResult") or "").strip()
     if part:
         _append_transcript(call_sid, "Callee", part, is_final=False)
@@ -1251,7 +1033,7 @@ def transcribe_partial():
 def status_callback():
     """
     Twilio status callback: initiated, ringing, answered, completed.
-    Used to toggle 'call_in_progress', to persist metadata, and to reset schedule after completion.
+    Used to toggle 'call_in_progress' and to reset the schedule after completion.
     """
     call_sid = request.values.get("CallSid", "") or ""
     call_status = (request.values.get("CallStatus") or "").lower()
@@ -1273,15 +1055,9 @@ def status_callback():
     if call_status in ("initiated", "ringing", "in-progress", "answered"):
         if call_sid:
             _set_current_call_sid(call_sid)
-            _init_call_meta_from_request(call_sid)
         _clear_outgoing_pending()
 
     if call_status == "completed":
-        with _CALL_META_LOCK:
-            meta = _CALL_META.get(call_sid, {})
-            meta["completed_at"] = time.time()
-            _CALL_META[call_sid] = meta
-        _finalize_call_with_recordings(call_sid)
         _set_current_call_sid(None)
         _clear_outgoing_pending()
         _reset_schedule_after_completion(now)
@@ -1402,6 +1178,7 @@ def _handle_termination(signum, frame):
         _stop_requested.set()
     except Exception:
         pass
+    # Give background threads a brief moment to exit, then terminate process
     try:
         time.sleep(0.5)
     except Exception:
@@ -1432,7 +1209,7 @@ def api_call_now():
         return jsonify(ok=False, reason="cap_reached", wait_seconds=wait_s), 429
     if _is_call_busy():
         return jsonify(ok=False, reason="already_in_progress", message="A call is already in progress."), 409
-    _mark_outgoing_pending()
+    _mark_outgoing_pending()  # reflect pending immediately to UI and prevent overlap before callbacks
     _manual_call_requested.set()
     return jsonify(ok=True)
 
@@ -1444,6 +1221,7 @@ def main():
     host = _runtime.flask_host or os.environ.get("FLASK_HOST", "0.0.0.0")
     port = int(_runtime.flask_port or _parse_int(os.environ.get("FLASK_PORT"), 8080))
     debug = bool(_runtime.flask_debug or _parse_bool(os.environ.get("FLASK_DEBUG"), False))
+    # use_reloader=False prevents duplicate processes that ignore signals
     app.run(host=host, port=port, debug=debug, use_reloader=False)
 
 

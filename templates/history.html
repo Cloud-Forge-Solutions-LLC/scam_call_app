@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Call History - Scam Call Console</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; background: #0b0f14; color: #f0f3f7; margin: 0; }
+    header { padding: 16px; background: #0f1720; display: flex; align-items: center; justify-content: space-between; }
+    h1 { font-size: 20px; margin: 0; }
+    main { max-width: 1100px; margin: 24px auto; padding: 0 16px; }
+    .btn { background: #1f6feb; color: #fff; border: none; padding: 8px 12px; border-radius: 6px; cursor: pointer; }
+    .btn.secondary { background: #334155; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    table { width: 100%; border-collapse: collapse; color: #e5e7eb; }
+    th, td { padding: 8px; border-bottom: 1px solid #1f2937; text-align: left; }
+    .card { background: #101826; border: 1px solid #1f2937; border-radius: 8px; padding: 16px; }
+    pre { white-space: pre-wrap; background: #0b1220; padding: 8px; border-radius: 6px; border: 1px solid #1f2937; }
+  </style>
+</head>
+<body>
+<header>
+  <h1>Call History</h1>
+  <div>
+    <a class="btn secondary" href="/scamcalls">Back</a>
+  </div>
+</header>
+<main class="grid">
+  <div class="card">
+    <h3>Calls</h3>
+    <table id="callsTable">
+      <thead>
+        <tr>
+          <th>When</th>
+          <th>SID</th>
+          <th>To</th>
+          <th>From</th>
+          <th>Duration</th>
+          <th>Recordings</th>
+        </tr>
+      </thead>
+      <tbody id="callsBody"></tbody>
+    </table>
+  </div>
+  <div class="card">
+    <h3>Details</h3>
+    <div id="details">Select a call.</div>
+  </div>
+</main>
+
+<script>
+function fmtTs(ts) {
+  if (!ts) return '';
+  const d = new Date(ts * 1000);
+  return d.toLocaleString();
+}
+function fmtDur(s) {
+  if (s == null) return '';
+  const m = Math.floor(s / 60);
+  const r = s % 60;
+  return `${m}m ${r}s`;
+}
+
+async function loadCalls() {
+  const r = await fetch('/api/history');
+  if (!r.ok) return;
+  const data = await r.json();
+  const body = document.getElementById('callsBody');
+  body.innerHTML = '';
+  (data.calls || []).forEach(c => {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td>${fmtTs(c.started_at)}</td>
+      <td><a href="#" data-sid="${c.sid}">${c.sid}</a></td>
+      <td>${c.to || ''}</td>
+      <td>${c.from || ''}</td>
+      <td>${fmtDur(c.duration_seconds)}</td>
+      <td>${c.has_recordings ? 'Yes' : 'No'}</td>
+    `;
+    body.appendChild(tr);
+  });
+  body.querySelectorAll('a[data-sid]').forEach(a => {
+    a.addEventListener('click', async (ev) => {
+      ev.preventDefault();
+      const sid = a.getAttribute('data-sid');
+      await loadDetails(sid);
+    });
+  });
+}
+
+async function loadDetails(sid) {
+  const r = await fetch('/api/history/' + sid);
+  if (!r.ok) return;
+  const d = await r.json();
+  const meta = d.meta || {};
+  const tx = d.transcript || [];
+  let html = '';
+  html += `<div><strong>SID:</strong> ${d.sid}</div>`;
+  html += `<div><strong>To:</strong> ${meta.to || ''} <strong>From:</strong> ${meta.from || ''}</div>`;
+  html += `<div><strong>Started:</strong> ${fmtTs(meta.started_at)} <strong>Completed:</strong> ${fmtTs(meta.completed_at)}</div>`;
+  html += `<div><strong>Voice:</strong> ${meta.voice || ''} <strong>Dialog Index:</strong> ${meta.dialog_idx ?? ''}</div>`;
+  if ((meta.recordings || []).length) {
+    html += `<h4>Recordings</h4>`;
+    (meta.recordings || []).forEach(r => {
+      const src = '/api/recording/' + r.recording_sid;
+      html += `<div><audio controls src="${src}"></audio> <small>Recording SID: ${r.recording_sid}</small></div>`;
+    });
+  }
+  html += `<h4>Transcript</h4>`;
+  html += '<pre>' + tx.map(e => {
+    const role = e.role || '';
+    const text = e.text || '';
+    const prefix = role === 'Assistant' ? 'Assistant: ' : (role === 'Callee' ? 'Callee: ' : '');
+    return prefix + text;
+  }).join('\n') + '</pre>';
+  document.getElementById('details').innerHTML = html;
+}
+
+loadCalls();
+</script>
+</body>
+</html>

@@ -1,135 +1,79 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="utf-8">
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>Scam Call Console</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <style>
-    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; background: #0b0f14; color: #f0f3f7; margin: 0; }
-    header { padding: 16px; background: #0f1720; display: flex; align-items: center; justify-content: space-between; }
-    h1 { font-size: 20px; margin: 0; }
-    main { max-width: 1100px; margin: 24px auto; padding: 0 16px; }
-    .btn { background: #1f6feb; color: #fff; border: none; padding: 8px 12px; border-radius: 6px; cursor: pointer; }
-    .btn.secondary { background: #334155; }
-    .btn:disabled { opacity: 0.6; cursor: not-allowed; }
-    .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
-    .card { background: #101826; border: 1px solid #1f2937; border-radius: 8px; padding: 16px; margin-top: 16px; }
-    table { width: 100%; border-collapse: collapse; color: #e5e7eb; }
-    th, td { padding: 8px; border-bottom: 1px solid #1f2937; text-align: left; }
-    .kv { display: grid; grid-template-columns: 250px 1fr; gap: 8px 12px; }
-    input[type=text] { width: 100%; background: #0b1220; color: #e5e7eb; border: 1px solid #1f2937; border-radius: 6px; padding: 8px; }
-    .warn { color: #fbbf24; font-size: 12px; }
-    .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; }
-    .badge.red { background: #7f1d1d; color: #fecaca; }
-    .badge.green { background: #0f5132; color: #c6f6d5; }
-  </style>
+  <link rel="icon" href="/static/favicon.svg" />
+  <link rel="stylesheet" href="/static/scamcalls.css" />
+  <link rel="stylesheet" href="/static/css/matrix.css" />
 </head>
-<body>
-<header>
-  <h1>Scam Call Console</h1>
-  <div class="row">
-    <a class="btn secondary" href="/scamcalls/history">History</a>
-    <a class="btn secondary" href="/admin/logout">Logout</a>
-  </div>
-</header>
-<main>
-  <div class="row">
-    <button id="callNow" class="btn">Call now</button>
-    <button id="addGreeting" class="btn secondary">Add greeting phrase</button>
-    <span id="activeBadge" class="badge red">Inactive</span>
-  </div>
+<body class="matrix-bg" data-is-admin="{{ '1' if is_admin else '0' }}">
+  <canvas id="matrix-canvas" aria-hidden="true"></canvas>
 
-  <div class="card">
-    <h3>Status</h3>
-    <div id="status"></div>
-    <div id="warnings" class="warn"></div>
-  </div>
+  <main class="page-container">
+    <header class="page-header">
+      <h1 class="app-title">Scam Call Console</h1>
+      <nav class="header-actions">
+        {% if is_admin %}
+          <a class="btn btn-secondary" href="/admin/logout" id="btnLogout">Logout</a>
+        {% else %}
+          <a class="btn btn-secondary" href="/admin/login" id="btnAdminLogin">Admin</a>
+        {% endif %}
+      </nav>
+    </header>
 
-  <div class="card">
-    <h3>Admin Settings</h3>
-    <div id="env"></div>
-  </div>
-</main>
-
-<script>
-async function fetchJSON(url, opts = {}) {
-  const r = await fetch(url, opts);
-  if (!r.ok) throw new Error(await r.text());
-  return await r.json();
-}
-
-async function refreshStatus() {
-  try {
-    const s = await fetchJSON('/api/status');
-    document.getElementById('activeBadge').textContent = s.within_active_window ? 'Active' : 'Inactive';
-    document.getElementById('activeBadge').className = 'badge ' + (s.within_active_window ? 'green' : 'red');
-    const lines = [];
-    lines.push(`<div>To: ${s.to_number || '(not set)'} | From: ${s.from_number || '(not set)'} </div>`);
-    lines.push(`<div>Active window: ${s.active_hours_local} on ${s.active_days.join(', ')}</div>`);
-    lines.push(`<div>Call in progress: ${s.call_in_progress}</div>`);
-    if (s.seconds_until_next != null) {
-      lines.push(`<div>Next attempt in: ${s.seconds_until_next}s</div>`);
-    }
-    document.getElementById('status').innerHTML = lines.join('');
-    const warn = (s.parse_warnings || []).map(w => `<div>Warning: ${w}</div>`).join('');
-    document.getElementById('warnings').innerHTML = warn;
-  } catch (e) {
-    document.getElementById('status').textContent = 'Failed to load status';
-  }
-}
-
-async function refreshEnv() {
-  try {
-    const r = await fetchJSON('/api/admin/env');
-    const rows = r.editable.map(kv => `
-      <tr>
-        <td>${kv.key}</td>
-        <td><input type="text" value="${kv.value || ''}" data-key="${kv.key}" /></td>
-      </tr>
-    `).join('');
-    document.getElementById('env').innerHTML = `
-      <table>
-        <thead><tr><th>Key</th><th>Value</th></tr></thead>
-        <tbody>${rows}</tbody>
-      </table>
-      <div class="row" style="margin-top:8px;">
-        <button id="saveEnv" class="btn secondary">Save</button>
+    <section class="card">
+      <div class="controls-row">
+        <button id="btnCallNow" class="btn btn-primary" type="button">Call now</button>
+        <button id="btnAddGreeting" class="btn" type="button">Add greeting phrase</button>
       </div>
-    `;
-    document.getElementById('saveEnv').onclick = async () => {
-      const inputs = document.querySelectorAll('#env input[data-key]');
-      const updates = {};
-      inputs.forEach(i => updates[i.dataset.key] = i.value);
-      await fetch('/api/admin/env', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ updates })});
-      await refreshStatus();
-    };
-  } catch (e) {
-    document.getElementById('env').textContent = 'Failed to load environment settings.';
-  }
-}
 
-document.getElementById('callNow').onclick = async () => {
-  const r = await fetch('/api/call-now', { method: 'POST' });
-  if (!r.ok) {
-    const t = await r.text();
-    alert('Call failed: ' + t);
-  } else {
-    await refreshStatus();
-  }
-};
+      <div id="statusArea" class="status-area" aria-live="polite"></div>
 
-document.getElementById('addGreeting').onclick = async () => {
-  const phrase = prompt('Enter a greeting phrase (5-15 words):');
-  if (!phrase) return;
-  const r = await fetch('/api/next-greeting', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ phrase })});
-  if (!r.ok) {
-    alert('Failed to set greeting.');
-  }
-};
+      {% if is_admin %}
+      <hr />
+      <section id="adminPanel" class="admin-panel">
+        <div class="admin-panel__header">
+          <h2>Admin Settings</h2>
+          <p class="muted">
+            Update non-secret configuration values. Values are loaded from the server and persisted back to .env.
+          </p>
+        </div>
+        <div id="envEditor" class="env-editor" data-endpoint-get="/api/admin/env" data-endpoint-post="/api/admin/env" aria-busy="true">
+          <div class="skeleton-row"></div>
+          <div class="skeleton-row"></div>
+          <div class="skeleton-row"></div>
+        </div>
+        <div class="form-actions">
+          <button id="btnSaveEnv" class="btn btn-primary" type="button" disabled>Save settings</button>
+        </div>
+      </section>
+      {% endif %}
+    </section>
 
-setInterval(refreshStatus, 2000);
-refreshStatus();
-refreshEnv();
-</script>
+    <div id="greetingModal" class="modal" aria-hidden="true" role="dialog" aria-modal="true" aria-labelledby="greetingModalTitle">
+      <div class="modal__dialog">
+        <div class="modal__header">
+          <h3 id="greetingModalTitle">One-time greeting phrase</h3>
+          <button class="modal__close" type="button" aria-label="Close" id="greetingCloseBtn">×</button>
+        </div>
+        <div class="modal__body">
+          <p>Enter a short phrase for the caller to say at the beginning of the next call. Keep it between 5 and 15 words.</p>
+          <textarea id="greetingInput" rows="3" maxlength="200" placeholder="Example: I am following up about your extended warranty."></textarea>
+          <div class="muted" id="greetingWordCount">0 words</div>
+        </div>
+        <div class="modal__footer">
+          <button class="btn btn-secondary" type="button" id="greetingCancelBtn">Cancel</button>
+          <button class="btn btn-primary" type="button" id="greetingSaveBtn" disabled>Save</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="toast" class="toast" role="status" aria-live="polite" aria-atomic="true"></div>
+  </main>
+
+  <script src="/static/js/matrix-rain.js"></script>
+  <script src="/static/scamcalls.js"></script>
 </body>
 </html>
