@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Caller Messages - Scam Call Console</title>
+  <link rel="icon" href="/static/favicon.svg" />
+  <link rel="stylesheet" href="/static/scamcalls.css" />
+  <link rel="stylesheet" href="/static/css/matrix.css" />
+</head>
+<body class="matrix-bg">
+  <canvas id="matrix-canvas" aria-hidden="true"></canvas>
+
+  <main class="page-container">
+    <header class="page-header">
+      <h1 class="app-title">Caller Messages</h1>
+      <nav class="header-actions">
+        <a class="btn btn-secondary" href="/scamcalls">Back</a>
+      </nav>
+    </header>
+
+    <section class="card" style="max-width: 900px;">
+      <div class="controls-row">
+        <span class="muted">Provide up to 10 messages. One will be chosen at random as the opening line.</span>
+        <button id="btnSaveMessages" class="btn btn-primary" type="button" style="margin-left:auto;">Save messages</button>
+      </div>
+
+      <div class="form-grid" style="grid-template-columns: 1fr 1fr; gap: 0.75rem;" id="messagesGrid">
+        <!-- rows are populated by JS -->
+      </div>
+
+      <div class="form-actions" style="justify-content: space-between;">
+        <div class="muted"><span id="msgCount">0</span>/10 configured</div>
+        <div>
+          <button id="btnClearAll" class="btn" type="button">Clear all</button>
+          <button id="btnLoadExamples" class="btn" type="button">Load examples</button>
+        </div>
+      </div>
+    </section>
+
+    <div id="toast" class="toast" role="status" aria-live="polite" aria-atomic="true"></div>
+  </main>
+
+  <script src="/static/js/matrix-rain.js"></script>
+  <script src="/static/messages.js"></script>
+</body>
+</html>
