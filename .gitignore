@@ -1,3 +1,5 @@
 # Environment files
 .env*
 .env*
+scam_app.db
+*.db

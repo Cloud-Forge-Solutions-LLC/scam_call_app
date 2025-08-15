@@ -513,7 +513,6 @@
   // -----------------------
   // Live conversation UI (transcript + optional audio listen)
   // -----------------------
-  // Style for live panel visuals
   (function ensureLivePanelStyle() {
     const id = "live-convo-style";
     if (qs(`#${id}`)) return;
@@ -547,18 +546,25 @@
 
   let liveTimer = null;
 
-  // Audio state (new)
+  // Audio state
   let ws = null;
   let audioCtx = null;
-  let playerNode = null;   // AudioWorkletNode (preferred)
-  let playerGain = null;   // GainNode to gate prebuffer and fade
   let workletLoaded = false;
+
+  // Chain nodes (created on demand)
+  let playerNode = null;    // AudioWorkletNode (preferred)
+  let scriptNode = null;    // ScriptProcessor fallback
+  let chainInput = null;    // Current source node into chain
+  let preGain = null;       // Gain used for prebuffer fade-in
+  let lowpass = null;       // BiquadFilterNode to smooth 8 kHz content
+  let compressor = null;    // DynamicsCompressorNode to even out harshness
+
+  // Buffer control
   let lastBufferSamples = 0;
-  let targetBufferSeconds = 0.12; // ~120 ms jitter buffer
+  let targetBufferSeconds = 0.18; // modest jitter buffer for fewer dropouts
   let targetBufferSamples = 0;
 
-  // Fallback (legacy) ScriptProcessor state
-  let scriptNode = null;
+  // Fallback queue
   let audioQueue = [];
   let playing = false;
 
@@ -665,7 +671,7 @@
     pollLiveTranscript();
   }
 
-  // Audio handling with μ-law 8 kHz -> AudioContext sample-rate conversion
+  // μ-law decoding and simple resample
   function mulawDecodeSample(mu) {
     mu = ~mu & 0xff;
     const sign = (mu & 0x80) ? -1 : 1;
@@ -710,7 +716,6 @@
     return out;
   }
 
-  // Legacy fallback processing callback
   function audioProcess(ev) {
     const out = ev.outputBuffer.getChannelData(0);
     out.fill(0);
@@ -735,6 +740,43 @@
     return 1.0;
   }
 
+  function ensureAudioChain() {
+    if (!audioCtx) return;
+
+    // Create shared processing nodes
+    if (!preGain) {
+      preGain = audioCtx.createGain();
+      preGain.gain.value = 0.0; // start muted; ramp in after prebuffer fills
+    }
+    if (!lowpass) {
+      lowpass = audioCtx.createBiquadFilter();
+      lowpass.type = "lowpass";
+      lowpass.frequency.value = 3600; // μ-law 8 kHz typical passband
+      lowpass.Q.value = 0.707;
+    }
+    if (!compressor) {
+      compressor = audioCtx.createDynamicsCompressor();
+      compressor.threshold.value = -18;
+      compressor.knee.value = 24;
+      compressor.ratio.value = 2.5;
+      compressor.attack.value = 0.003;
+      compressor.release.value = 0.25;
+    }
+
+    // Rebuild chain for current source
+    try { preGain.disconnect(); } catch {}
+    try { lowpass.disconnect(); } catch {}
+    try { compressor.disconnect(); } catch {}
+
+    if (chainInput) {
+      try { chainInput.disconnect(); } catch {}
+      chainInput.connect(preGain);
+      preGain.connect(lowpass);
+      lowpass.connect(compressor);
+      compressor.connect(audioCtx.destination);
+    }
+  }
+
   async function startListening() {
     const status = qs("#listenStatus");
     const btn = qs("#btnListenLive");
@@ -757,6 +799,7 @@
           workletLoaded = false;
         }
       }
+
       if (workletLoaded && !playerNode) {
         playerNode = new AudioWorkletNode(audioCtx, "live-player-processor");
         playerNode.port.onmessage = (ev) => {
@@ -764,37 +807,45 @@
           if (d.type === "buffer") {
             lastBufferSamples = d.samples | 0;
             // Auto-unmute when prebuffer is ready
-            if (playerGain && playerGain.gain.value === 0 && lastBufferSamples >= Math.floor(targetBufferSamples * 0.6)) {
+            if (preGain && preGain.gain.value === 0 && lastBufferSamples >= Math.floor(targetBufferSamples * 0.6)) {
               const t = audioCtx.currentTime;
-              playerGain.gain.cancelScheduledValues(t);
-              playerGain.gain.setValueAtTime(playerGain.gain.value, t);
-              playerGain.gain.linearRampToValueAtTime(1.0, t + 0.05);
+              preGain.gain.cancelScheduledValues(t);
+              preGain.gain.setValueAtTime(preGain.gain.value, t);
+              preGain.gain.linearRampToValueAtTime(1.0, t + 0.06);
             }
           }
         };
-        playerGain = audioCtx.createGain();
-        playerGain.gain.value = 0.0; // start muted; unmute after prebuffer
-        playerNode.connect(playerGain);
-        playerGain.connect(audioCtx.destination);
       }
 
       const scheme = location.protocol === "https:" ? "wss" : "ws";
       ws = new WebSocket(`${scheme}://${location.host}/client-audio`);
-      // Accept both string (base64) and binary frames
       try { ws.binaryType = "arraybuffer"; } catch {}
 
       ws.onopen = async () => {
         lastBufferSamples = 0;
-        if (!workletLoaded) {
+
+        // Choose chain input based on available nodes
+        if (workletLoaded) {
+          chainInput = playerNode;
+        } else {
           // Fallback to ScriptProcessor with smaller buffer to reduce latency
           if (!scriptNode) {
-            const bufSize = 1024; // lower than 4096 to reduce lag
+            const bufSize = 1024;
             scriptNode = audioCtx.createScriptProcessor(bufSize, 0, 1);
             scriptNode.onaudioprocess = audioProcess;
-            scriptNode.connect(audioCtx.destination);
           }
+          chainInput = scriptNode;
           playing = true;
         }
+
+        ensureAudioChain(); // (re)wire processing chain
+        // Connect chain to destination if not already
+        if (workletLoaded && playerNode && playerNode.numberOfOutputs > 0) {
+          // No additional connect needed here; ensureAudioChain wires it
+        } else if (scriptNode) {
+          // ensureAudioChain already attached scriptNode path
+        }
+
         if (status) status.textContent = "Connected";
         if (btn) btn.textContent = "Stop listening";
       };
@@ -804,16 +855,27 @@
           let pcm8k = null;
 
           if (ev.data instanceof ArrayBuffer) {
-            // Binary μ-law payload (optional future server optimization)
+            // Binary μ-law payload (optional server optimization)
             pcm8k = decodeMuLawBytesToFloat32(new Uint8Array(ev.data));
           } else if (typeof ev.data === "string") {
-            // Maintain compatibility with current server (base64 μ-law payload string)
-            // Also accept JSON if server later forwards full Twilio media envelope
+            // Accept both raw base64 μ-law and JSON envelopes
             if (ev.data.length > 0 && ev.data[0] === "{") {
               try {
                 const obj = JSON.parse(ev.data);
+
+                // Prefer the caller (inbound) track if provided
+                const track = obj && obj.media && (obj.media.track || obj.media.direction);
                 const payloadB64 = obj && obj.media && obj.media.payload ? obj.media.payload : obj.payload;
+
                 if (payloadB64) {
+                  // If server labels tracks, ignore outbound to avoid hearing the callee/bot
+                  if (track && typeof track === "string") {
+                    const t = track.toLowerCase();
+                    if (t.includes("outbound") || t.includes("callee")) {
+                      // Ignore outbound frames so we only play caller audio
+                      return;
+                    }
+                  }
                   pcm8k = decodeMuLawToFloat32(payloadB64);
                 } else {
                   return;
@@ -834,13 +896,11 @@
           const ratioAdjust = computeRatioAdjust();
           const pcm = resampleToContextRate(pcm8k, audioCtx.sampleRate, ratioAdjust);
 
-          if (playerNode) {
-            // Transfer the underlying buffer to the worklet to minimize copies
+          if (workletLoaded && playerNode) {
             if (pcm && pcm.buffer) {
               playerNode.port.postMessage({ type: "push", pcm: pcm.buffer }, [pcm.buffer]);
             }
           } else {
-            // Legacy fallback path
             audioQueue.push(pcm);
           }
         } catch {
@@ -853,11 +913,11 @@
         if (btn) btn.textContent = "Listen live";
         if (!workletLoaded) {
           playing = false;
-        } else if (playerGain && audioCtx) {
+        } else if (preGain && audioCtx) {
           const t = audioCtx.currentTime;
-          playerGain.gain.cancelScheduledValues(t);
-          playerGain.gain.setValueAtTime(playerGain.gain.value, t);
-          playerGain.gain.linearRampToValueAtTime(0.0, t + 0.05);
+          preGain.gain.cancelScheduledValues(t);
+          preGain.gain.setValueAtTime(preGain.gain.value, t);
+          preGain.gain.linearRampToValueAtTime(0.0, t + 0.05);
         }
         ws = null;
       };
@@ -885,11 +945,11 @@
     ws = null;
     if (!workletLoaded) {
       playing = false;
-    } else if (playerGain && audioCtx) {
+    } else if (preGain && audioCtx) {
       const t = audioCtx.currentTime;
-      playerGain.gain.cancelScheduledValues(t);
-      playerGain.gain.setValueAtTime(playerGain.gain.value, t);
-      playerGain.gain.linearRampToValueAtTime(0.0, t + 0.05);
+      preGain.gain.cancelScheduledValues(t);
+      preGain.gain.setValueAtTime(preGain.gain.value, t);
+      preGain.gain.linearRampToValueAtTime(0.0, t + 0.05);
     }
     if (status) status.textContent = "Stopped";
     if (btn) btn.textContent = "Listen live";
