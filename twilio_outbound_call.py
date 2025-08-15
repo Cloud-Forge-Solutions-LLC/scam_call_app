@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Scam Call Console: Outbound caller service with admin UI, pacing, Twilio voice,
-optional Media Streams, live transcript API, history APIs, and clean shutdown.
+optional Media Streams, live transcript API, history APIs, speech settings, message rotation,
+and clean shutdown.
 
 Diagnostic build:
 - Adds comprehensive logging for call placement and scheduling
@@ -130,6 +131,10 @@ def _mask_sid(sid: Optional[str]) -> str:
     return f"{s[:4]}...{s[-4:]}"
 
 
+def _xml_escape(s: str) -> str:
+    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;").replace("'", "&apos;")
+
+
 app = Flask(__name__, static_folder="static", template_folder="templates")
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_host=1)  # type: ignore
 app.secret_key = os.environ.get("FLASK_SECRET", os.urandom(32))
@@ -196,6 +201,10 @@ def _overlay_env_from_dotenv(path: str) -> None:
 _overlay_env_from_dotenv(".env")
 
 
+DATA_DIR = Path("data")
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+
 @dataclass
 class RuntimeConfig:
     to_number: str = ""
@@ -214,6 +223,16 @@ class RuntimeConfig:
 
     tts_voice: str = "man"
     tts_language: str = "en-US"
+    # Additional TTS controls
+    tts_rate_percent: int = 100       # 50..200
+    tts_pitch_semitones: int = 0      # -12..+12
+    tts_volume_db: int = 0            # -6..+6
+
+    # Timing controls
+    greeting_pause_seconds: float = 1.0           # pause between greeting lines
+    response_pause_seconds: float = 0.5           # pause before assistant responds
+    between_phrases_pause_seconds: float = 1.0    # pause between multi-part phrases
+
     max_dialog_turns: int = 6
     rotate_prompts: bool = True
     rotate_prompts_strategy: str = "random"
@@ -286,6 +305,22 @@ def _load_runtime_from_env() -> None:
 
     _runtime.tts_voice = (os.environ.get("TTS_VOICE") or "man").strip()
     _runtime.tts_language = (os.environ.get("TTS_LANGUAGE") or "en-US").strip()
+    _runtime.tts_rate_percent = max(50, min(200, _parse_int(os.environ.get("TTS_RATE_PERCENT"), 100)))
+    _runtime.tts_pitch_semitones = max(-12, min(12, _parse_int(os.environ.get("TTS_PITCH_SEMITONES"), 0)))
+    _runtime.tts_volume_db = max(-6, min(6, _parse_int(os.environ.get("TTS_VOLUME_DB"), 0)))
+
+    def _parse_float_env(name: str, default: float, lo: float, hi: float) -> float:
+        try:
+            v = float(str(os.environ.get(name, "")).strip())
+        except Exception:
+            v = default
+        v = max(lo, min(hi, v))
+        return round(v, 2)
+
+    _runtime.greeting_pause_seconds = _parse_float_env("GREETING_PAUSE_SECONDS", 1.0, 0.0, 5.0)
+    _runtime.response_pause_seconds = _parse_float_env("RESPONSE_PAUSE_SECONDS", 0.5, 0.0, 5.0)
+    _runtime.between_phrases_pause_seconds = _parse_float_env("BETWEEN_PHRASES_PAUSE_SECONDS", 1.0, 0.0, 5.0)
+
     _runtime.max_dialog_turns = max(0, _parse_int(os.environ.get("MAX_DIALOG_TURNS"), 6))
 
     _runtime.recording_mode = (os.environ.get("RECORDING_MODE") or "off").strip().lower()
@@ -323,6 +358,12 @@ _EDITABLE_ENV_KEYS = [
     "RECORDING_JURISDICTION_MODE",
     "TTS_VOICE",
     "TTS_LANGUAGE",
+    "TTS_RATE_PERCENT",
+    "TTS_PITCH_SEMITONES",
+    "TTS_VOLUME_DB",
+    "GREETING_PAUSE_SECONDS",
+    "RESPONSE_PAUSE_SECONDS",
+    "BETWEEN_PHRASES_PAUSE_SECONDS",
     "MAX_DIALOG_TURNS",
     "ROTATE_PROMPTS",
     "ROTATE_PROMPTS_STRATEGY",
@@ -1129,6 +1170,18 @@ def scamcalls_history():
     return render_template("history.html")
 
 
+@app.route("/scamcalls/speech", methods=["GET"])
+def scamcalls_speech():
+    log.info("GET /scamcalls/speech")
+    return render_template("speech.html")
+
+
+@app.route("/scamcalls/messages", methods=["GET"])
+def scamcalls_messages():
+    log.info("GET /scamcalls/messages")
+    return render_template("messages.html")
+
+
 # Admin auth
 def _admin_defaults() -> Tuple[str, Optional[str], bool]:
     env_user = (os.environ.get("ADMIN_USER") or "").strip() or (_runtime.admin_user or "").strip() if _runtime.admin_user else None
@@ -1218,204 +1271,206 @@ def api_admin_env_post():
         return Response("Failed to save settings.", status=500)
 
 
-# Status API
-@app.route("/api/status", methods=["GET"])
-def api_status():
-    now_i = int(time.time())
-    with _next_call_epoch_s_lock:
-        next_epoch = _next_call_epoch_s
-        interval_start = _interval_start_epoch_s
-        interval_total = _interval_total_seconds
+# Speech settings API (open to all users)
+_SUPPORTED_VOICES = [
+    # Twilio built-ins
+    "man", "woman", "alice",
+    # Select Amazon Polly voices commonly available via Twilio
+    "Polly.Joanna", "Polly.Matthew", "Polly.Kendra", "Polly.Joey",
+    "Polly.Brian", "Polly.Amy", "Polly.Emma", "Polly.Russell",
+    "Polly.Nicole", "Polly.Geraint", "Polly.Lucy",
+]
 
-    pend = _is_outgoing_pending()
-    active_sid = _get_current_call_sid()
-    call_in_progress = bool(active_sid)
-
-    within = _within_active_window(_now_local())
-    to = _runtime.to_number
-    attempts_last_hour = 0
-    attempts_last_day = 0
-    can_attempt = True
-    wait_if_capped = 0
-    if to:
-        _prune_attempts(now_i, to)
-        with _attempts_lock:
-            lst = _dest_attempts.get(to, [])
-            attempts_last_hour = len([t for t in lst if t >= now_i - 3600])
-            attempts_last_day = len(lst)
-        can_attempt, wait_if_capped = _can_attempt(now_i, to)
-
-    seconds_until_next = None
-    if not call_in_progress and next_epoch is not None:
-        seconds_until_next = max(0, int(next_epoch - now_i))
-
-    interval_elapsed = None
-    if interval_start is not None and interval_total is not None:
-        interval_elapsed = None if call_in_progress else max(0, now_i - interval_start)
-
-    ready, reasons = _diagnostics_ready_to_call()
-
-    with _LAST_DIAL_ERROR_LOCK:
-        last_error = dict(_LAST_DIAL_ERROR) if _LAST_DIAL_ERROR else None
-
-    payload = {
-        "now_epoch": now_i,
-        "next_call_epoch": next_epoch,
-        "seconds_until_next": seconds_until_next,
-        "within_active_window": within,
-        "active_hours_local": _runtime.active_hours_local,
-        "active_days": _runtime.active_days,
-        "attempts_last_hour": attempts_last_hour,
-        "attempts_last_day": attempts_last_day,
-        "hourly_max_attempts": _runtime.hourly_max_attempts,
-        "daily_max_attempts": _runtime.daily_max_attempts,
-        "can_attempt_now": can_attempt,
-        "wait_seconds_if_capped": wait_if_capped,
-        "interval_total_seconds": interval_total,
-        "interval_elapsed_seconds": interval_elapsed,
-        "to_number": _runtime.to_number,
-        "from_number": _runtime.from_number,
-        "from_numbers": _runtime.from_numbers,
-        "call_in_progress": call_in_progress,
-        "outgoing_pending": pend,
-        "media_streams_enabled": bool(_runtime.enable_media_streams),
-        "public_base_url": _runtime.public_base_url or "",
-        "ready_to_call": ready,
-        "not_ready_reasons": reasons,
-        "last_error": last_error,
-    }
-    log.debug(
-        "GET /api/status -> in_progress=%s, seconds_until_next=%s, pending=%s, ready=%s, reasons=%s",
-        call_in_progress, seconds_until_next, pend, ready, reasons
-    )
-    return jsonify(payload)
+_SUPPORTED_LANGUAGES = [
+    "en-US", "en-GB", "en-AU", "en-CA",
+    "es-US", "es-ES", "fr-FR", "de-DE",
+    "it-IT", "pt-BR",
+]
 
 
-# Live transcript API
-@app.route("/api/live", methods=["GET"])
-def api_live_transcript():
-    sid = _get_current_call_sid()
-    with _TRANSCRIPTS_LOCK:
-        transcript = list(_TRANSCRIPTS.get(sid or "", [])) if sid else []
-    log.debug("GET /api/live -> in_progress=%s, sid=%s, entries=%s", bool(sid), _mask_sid(sid), len(transcript))
+@app.route("/api/speech-settings", methods=["GET"])
+def api_speech_settings_get():
+    log.info("GET /api/speech-settings")
     return jsonify({
-        "ok": True,
-        "in_progress": bool(sid),
-        "callSid": sid or "",
-        "transcript": transcript,
-        "media_streams_enabled": bool(_runtime.enable_media_streams),
+        "voices": _SUPPORTED_VOICES,
+        "languages": _SUPPORTED_LANGUAGES,
+        "values": {
+            "tts_voice": _runtime.tts_voice,
+            "tts_language": _runtime.tts_language,
+            "tts_rate_percent": _runtime.tts_rate_percent,
+            "tts_pitch_semitones": _runtime.tts_pitch_semitones,
+            "tts_volume_db": _runtime.tts_volume_db,
+            "greeting_pause_seconds": _runtime.greeting_pause_seconds,
+            "response_pause_seconds": _runtime.response_pause_seconds,
+            "between_phrases_pause_seconds": _runtime.between_phrases_pause_seconds,
+        }
     })
 
 
-# History APIs
-@app.route("/api/history", methods=["GET"])
-def api_history_list():
-    items = _scan_history_summaries()
-    log.info("GET /api/history -> %s items", len(items))
-    return jsonify({"calls": items})
-
-
-@app.route("/api/history/<sid>", methods=["GET"])
-def api_history_detail(sid: str):
-    d = _load_call_history(sid)
-    if not d:
-        log.info("GET /api/history/%s -> 404", _mask_sid(sid))
-        return Response("Not found", status=404)
-    log.info("GET /api/history/%s -> ok", _mask_sid(sid))
-    return jsonify(d)
-
-
-@app.route("/api/recording/<recording_sid>", methods=["GET"])
-def api_recording_proxy(recording_sid: str):
-    account_sid = os.environ.get("TWILIO_ACCOUNT_SID", "")
-    auth_token = os.environ.get("TWILIO_AUTH_TOKEN", "")
-    if not account_sid or not auth_token:
-        log.error("Recording fetch failed: Twilio credentials not configured.")
-        return Response("Twilio credentials not configured.", status=500)
-    url = f"https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Recordings/{recording_sid}.mp3"
-    req = urllib.request.Request(url)
-    b64 = base64.b64encode(f"{account_sid}:{auth_token}".encode("utf-8")).decode("ascii")
-    req.add_header("Authorization", f"Basic {b64}")
+@app.route("/api/speech-settings", methods=["POST"])
+def api_speech_settings_post():
     try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            data = resp.read()
-            log.info("Proxied recording %s (%s bytes).", recording_sid, len(data))
-            return Response(data, status=200, mimetype="audio/mpeg")
-    except Exception as e:
-        log.error("Failed to stream recording %s: %s", recording_sid, e)
-        return Response("Recording unavailable.", status=404)
-
-
-# One-shot greeting setter
-_ONE_SHOT_GREETING: Optional[str] = None
-_ONE_SHOT_GREETING_LOCK = threading.Lock()
-
-
-def _pop_one_shot_opening() -> Optional[str]:
-    global _ONE_SHOT_GREETING
-    with _ONE_SHOT_GREETING_LOCK:
-        val = _ONE_SHOT_GREETING
-        _ONE_SHOT_GREETING = None
-        if val:
-            log.info("One-shot greeting consumed (len=%s).", len(val))
-        return val
-
-
-@app.route("/api/next-greeting", methods=["POST"])
-def api_next_greeting():
-    try:
-        data = request.get_json(force=True, silent=True) or {}
+        data = request.get_json(force=True, silent=False) or {}
     except Exception:
         data = {}
-    phrase = (data.get("phrase") or "").strip()
-    words = [w for w in re.split(r"\s+", phrase) if w]
-    if not (5 <= len(words) <= 15):
-        log.info("POST /api/next-greeting rejected: words=%s", len(words))
-        return Response("Phrase must be between 5 and 15 words.", status=400)
-    global _ONE_SHOT_GREETING
-    with _ONE_SHOT_GREETING_LOCK:
-        _ONE_SHOT_GREETING = phrase
-    log.info("POST /api/next-greeting accepted: words=%s, len=%s", len(words), len(phrase))
-    return jsonify(ok=True)
+    updates: Dict[str, str] = {}
+
+    voice = (data.get("tts_voice") or "").strip()
+    if voice and voice in _SUPPORTED_VOICES:
+        updates["TTS_VOICE"] = voice
+
+    lang = (data.get("tts_language") or "").strip()
+    if lang and lang in _SUPPORTED_LANGUAGES:
+        updates["TTS_LANGUAGE"] = lang
+
+    def clamp_int(val, lo, hi, default):
+        try:
+            v = int(val)
+        except Exception:
+            v = default
+        return max(lo, min(hi, v))
+
+    def clamp_float(val, lo, hi, default):
+        try:
+            v = float(val)
+        except Exception:
+            v = default
+        v = max(lo, min(hi, v))
+        return round(v, 2)
+
+    updates["TTS_RATE_PERCENT"] = str(clamp_int(data.get("tts_rate_percent"), 50, 200, _runtime.tts_rate_percent))
+    updates["TTS_PITCH_SEMITONES"] = str(clamp_int(data.get("tts_pitch_semitones"), -12, 12, _runtime.tts_pitch_semitones))
+    updates["TTS_VOLUME_DB"] = str(clamp_int(data.get("tts_volume_db"), -6, 6, _runtime.tts_volume_db))
+
+    updates["GREETING_PAUSE_SECONDS"] = str(clamp_float(data.get("greeting_pause_seconds"), 0.0, 5.0, _runtime.greeting_pause_seconds))
+    updates["RESPONSE_PAUSE_SECONDS"] = str(clamp_float(data.get("response_pause_seconds"), 0.0, 5.0, _runtime.response_pause_seconds))
+    updates["BETWEEN_PHRASES_PAUSE_SECONDS"] = str(clamp_float(data.get("between_phrases_pause_seconds"), 0.0, 5.0, _runtime.between_phrases_pause_seconds))
+
+    _apply_env_updates(updates)
+    return jsonify(ok=True, values={
+        "tts_voice": _runtime.tts_voice,
+        "tts_language": _runtime.tts_language,
+        "tts_rate_percent": _runtime.tts_rate_percent,
+        "tts_pitch_semitones": _runtime.tts_pitch_semitones,
+        "tts_volume_db": _runtime.tts_volume_db,
+        "greeting_pause_seconds": _runtime.greeting_pause_seconds,
+        "response_pause_seconds": _runtime.response_pause_seconds,
+        "between_phrases_pause_seconds": _runtime.between_phrases_pause_seconds,
+    })
 
 
-@app.route("/api/diag/state", methods=["GET"])
-def api_diag_state():
-    # Expose a concise snapshot for troubleshooting
-    now_ts = int(time.time())
-    pend = _is_outgoing_pending()
-    active_sid = _get_current_call_sid()
-    ready, reasons = _diagnostics_ready_to_call()
-    can_now, wait_s = (True, 0)
-    if _runtime.to_number:
-        can_now, wait_s = _can_attempt(now_ts, _runtime.to_number)
-    with _next_call_epoch_s_lock:
-        next_epoch = _next_call_epoch_s
-        interval_total = _interval_total_seconds
-        interval_start = _interval_start_epoch_s
-    with _LAST_DIAL_ERROR_LOCK:
-        last_error = dict(_LAST_DIAL_ERROR) if _LAST_DIAL_ERROR else None
-    payload = {
-        "active_sid": active_sid,
-        "pending": pend,
-        "ready": ready,
-        "reasons": reasons,
-        "can_attempt": can_now,
-        "wait_if_capped": wait_s,
-        "to": _runtime.to_number,
-        "from": _runtime.from_number,
-        "from_pool": _runtime.from_numbers,
-        "public_base_url": _runtime.public_base_url,
-        "active_hours_local": _runtime.active_hours_local,
-        "active_days": _runtime.active_days,
-        "next_call_epoch": next_epoch,
-        "interval_total": interval_total,
-        "interval_start": interval_start,
-        "last_error": last_error,
-        "twilio_http_timeout_seconds": _runtime.twilio_http_timeout_seconds,
-    }
-    log.info("GET /api/diag/state -> %s", {**payload, "to": _mask_phone(payload["to"]), "from": _mask_phone(payload["from"])})
-    return jsonify(payload)
+# Messages rotation (max 10)
+MESSAGES_FILE = DATA_DIR / "messages.json"
+_USER_MESSAGES_LOCK = threading.Lock()
+_USER_MESSAGES: List[str] = []
+
+
+def _load_user_messages_from_disk() -> List[str]:
+    if not MESSAGES_FILE.exists():
+        return []
+    try:
+        raw = json.loads(MESSAGES_FILE.read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            items = raw.get("messages", [])
+        else:
+            items = raw
+        out: List[str] = []
+        for s in items:
+            if isinstance(s, str):
+                t = s.strip()
+                if t:
+                    out.append(t)
+        return out[:10]
+    except Exception:
+        return []
+
+
+def _persist_user_messages_to_disk(msgs: List[str]) -> None:
+    try:
+        MESSAGES_FILE.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"messages": msgs[:10]}
+        MESSAGES_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        log.info("Persisted %s user messages for rotation.", len(payload["messages"]))
+    except Exception as e:
+        log.error("Failed to persist user messages: %s", e)
+
+
+def _init_user_messages() -> None:
+    global _USER_MESSAGES
+    with _USER_MESSAGES_LOCK:
+        _USER_MESSAGES = _load_user_messages_from_disk()
+    if _USER_MESSAGES:
+        log.info("Loaded %s user messages from disk.", len(_USER_MESSAGES))
+    else:
+        log.info("No user messages configured; using built-in dialogs.")
+
+
+_init_user_messages()
+
+
+@app.route("/api/messages", methods=["GET"])
+def api_messages_get():
+    with _USER_MESSAGES_LOCK:
+        msgs = list(_USER_MESSAGES)
+    return jsonify({"messages": msgs})
+
+
+@app.route("/api/messages", methods=["POST"])
+def api_messages_post():
+    try:
+        data = request.get_json(force=True, silent=False) or {}
+    except Exception:
+        data = {}
+    items = data.get("messages")
+    if not isinstance(items, list):
+        return Response("Invalid payload.", status=400)
+    cleaned: List[str] = []
+    for s in items:
+        if not isinstance(s, str):
+            continue
+        t = s.strip()
+        if not t:
+            continue
+        cleaned.append(t)
+        if len(cleaned) >= 10:
+            break
+    with _USER_MESSAGES_LOCK:
+        global _USER_MESSAGES
+        _USER_MESSAGES = cleaned
+    _persist_user_messages_to_disk(cleaned)
+    return jsonify(ok=True, messages=cleaned)
+
+
+def _pick_user_message() -> Optional[str]:
+    with _USER_MESSAGES_LOCK:
+        if not _USER_MESSAGES:
+            return None
+        return random.choice(_USER_MESSAGES)
+
+
+def _say_with_prosody(vr: VoiceResponse, text: str, voice: str, language: str) -> None:
+    """
+    Attempt to apply SSML prosody controls if a Polly voice is selected.
+    Falls back to plain <Say> on any error.
+    """
+    text = text or ""
+    try:
+        if voice.startswith("Polly.") and (  # SSML prosody is supported with Polly voices
+            _runtime.tts_rate_percent != 100 or _runtime.tts_pitch_semitones != 0 or _runtime.tts_volume_db != 0
+        ):
+            rate = f"{_runtime.tts_rate_percent}%"
+            pitch_sign = "+" if _runtime.tts_pitch_semitones >= 0 else ""
+            pitch = f"{pitch_sign}{_runtime.tts_pitch_semitones}st"
+            vol_sign = "+" if _runtime.tts_volume_db >= 0 else ""
+            volume = f"{vol_sign}{_runtime.tts_volume_db}dB"
+            ssml = f"<speak><prosody rate='{rate}' pitch='{pitch}' volume='{volume}'>{_xml_escape(text)}</prosody></speak>"
+            vr.say(ssml, voice=voice, language=language)
+            return
+        # Fallback to plain <Say>
+        vr.say(text, voice=voice, language=language)
+    except Exception as e:
+        log.warning("SSML say failed; falling back to plain say: %s", e)
+        vr.say(text, voice=voice, language=language)
 
 
 def _build_opening_lines_for_sid(call_sid: str) -> List[str]:
@@ -1423,10 +1478,14 @@ def _build_opening_lines_for_sid(call_sid: str) -> List[str]:
     if one:
         lines = [one]
     else:
-        params = _get_params_for_sid(call_sid)
-        base_dialog = _get_dialog_lines(params.dialog_idx)
-        first = base_dialog[0] if base_dialog else "Hello."
-        lines = [first]
+        pick = _pick_user_message()
+        if pick:
+            lines = [pick]
+        else:
+            params = _get_params_for_sid(call_sid)
+            base_dialog = _get_dialog_lines(params.dialog_idx)
+            first = base_dialog[0] if base_dialog else "Hello."
+            lines = [first]
     if _runtime.company_name:
         lines.append(f"This is {_runtime.company_name}.")
     if _runtime.topic:
@@ -1518,9 +1577,9 @@ def hello_got_speech():
     opening_lines = _build_opening_lines_for_sid(call_sid)
     for i, line in enumerate(opening_lines):
         _append_transcript(call_sid, "Assistant", line, is_final=True)
-        vr.say(line, voice=params.voice, language=_runtime.tts_language)
-        if i < len(opening_lines) - 1:
-            vr.pause(length=1)
+        _say_with_prosody(vr, line, voice=params.voice, language=_runtime.tts_language)
+        if i < len(opening_lines) - 1 and _runtime.greeting_pause_seconds > 0:
+            vr.pause(length=_runtime.greeting_pause_seconds)
 
     g = Gather(
         input="speech",
@@ -1534,7 +1593,7 @@ def hello_got_speech():
         language=_runtime.tts_language,
     )
     vr.append(g)
-    vr.say("Goodbye.", voice=params.voice, language=_runtime.tts_language)
+    _say_with_prosody(vr, "Goodbye.", voice=params.voice, language=_runtime.tts_language)
     vr.hangup()
     return Response(str(vr), status=200, mimetype="text/xml")
 
@@ -1557,14 +1616,21 @@ def dialog():
     if speech_text:
         _append_transcript(call_sid, "Callee", speech_text, is_final=True)
 
+    # Optional pause before the assistant responds (timing config)
+    if _runtime.response_pause_seconds > 0:
+        try:
+            vr.pause(length=_runtime.response_pause_seconds)
+        except Exception:
+            pass
+
     params = _get_params_for_sid(call_sid)
     reply_lines = _compose_assistant_reply(call_sid, turn)
     log.info("Assistant reply line count=%s", len(reply_lines))
     for i, line in enumerate(reply_lines):
         _append_transcript(call_sid, "Assistant", line, is_final=True)
-        vr.say(line, voice=params.voice, language=_runtime.tts_language)
-        if i < len(reply_lines) - 1:
-            vr.pause(length=1)
+        _say_with_prosody(vr, line, voice=params.voice, language=_runtime.tts_language)
+        if i < len(reply_lines) - 1 and _runtime.between_phrases_pause_seconds > 0:
+            vr.pause(length=_runtime.between_phrases_pause_seconds)
 
     if turn < _runtime.max_dialog_turns:
         next_turn = turn + 1
@@ -1580,10 +1646,10 @@ def dialog():
             language=_runtime.tts_language,
         )
         vr.append(g)
-        vr.say("Goodbye.", voice=params.voice, language=_runtime.tts_language)
+        _say_with_prosody(vr, "Goodbye.", voice=params.voice, language=_runtime.tts_language)
         vr.hangup()
     else:
-        vr.say("Goodbye.", voice=params.voice, language=_runtime.tts_language)
+        _say_with_prosody(vr, "Goodbye.", voice=params.voice, language=_runtime.tts_language)
         vr.hangup()
 
     return Response(str(vr), status=200, mimetype="text/xml")
