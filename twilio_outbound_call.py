@@ -1344,7 +1344,7 @@ def api_speech_settings_post():
 
     updates["GREETING_PAUSE_SECONDS"] = str(clamp_float(data.get("greeting_pause_seconds"), 0.0, 5.0, _runtime.greeting_pause_seconds))
     updates["RESPONSE_PAUSE_SECONDS"] = str(clamp_float(data.get("response_pause_seconds"), 0.0, 5.0, _runtime.response_pause_seconds))
-    updates["BETWEEN_PHRASES_PAUSE_SECONDS"] = str(clamp_float(data.get("between_phrases_pause_seconds"), 0.0, 5.0, _runtime.between_phrases_pause_seconds))
+    updates["BETWEEN_PHRASES_PAUSE_SECONDS"] = str(clamp_float(data.get("between_phrases_pauses_seconds") if "between_phrases_pauses_seconds" in data else data.get("between_phrases_pause_seconds"), 0.0, 5.0, _runtime.between_phrases_pause_seconds))
 
     _apply_env_updates(updates)
     return jsonify(ok=True, values={
@@ -1929,6 +1929,91 @@ def api_call_now():
     _manual_call_requested.set()
     log.info("Call-now accepted; manual request queued.")
     return jsonify(ok=True, queued=True)
+
+
+# New: API endpoint the frontend expects for status display
+@app.route("/api/status", methods=["GET"])
+def api_status():
+    """
+    Return JSON describing current scheduler state, caps, next attempt countdown,
+    whether we are within the active calling window, and any recent placement error.
+    This endpoint is polled by the frontend.
+    """
+    now = int(time.time())
+    # seconds until next scheduled attempt and interval total
+    with _next_call_epoch_s_lock:
+        seconds_until_next = int(max(0, _next_call_epoch_s - now)) if _next_call_epoch_s is not None else None
+        interval_total = int(_interval_total_seconds) if _interval_total_seconds is not None else None
+
+    # attempts counts for the current to_number (last hour and last day)
+    attempts_last_hour = 0
+    attempts_last_day = 0
+    if _runtime.to_number:
+        with _attempts_lock:
+            lst = list(_dest_attempts.get(_runtime.to_number, []))
+        cutoff_h = now - 3600
+        cutoff_d = now - 24 * 3600
+        attempts_last_hour = sum(1 for t in lst if t >= cutoff_h)
+        attempts_last_day = sum(1 for t in lst if t >= cutoff_d)
+
+    # can attempt now and wait seconds if capped
+    can_attempt_now = True
+    wait_seconds_if_capped = 0
+    if _runtime.to_number:
+        can_attempt_now, wait_seconds_if_capped = _can_attempt(now, _runtime.to_number)
+
+    # whether a call is currently in progress
+    call_sid = _get_current_call_sid()
+    call_in_progress = bool(call_sid)
+
+    # within active hours/gate
+    within_active = _within_active_window(_now_local())
+
+    # last error
+    last_err = None
+    with _LAST_DIAL_ERROR_LOCK:
+        if _LAST_DIAL_ERROR:
+            last_err = dict(_LAST_DIAL_ERROR)
+
+    payload = {
+        "call_in_progress": call_in_progress,
+        "call_sid": call_sid or "",
+        "within_active_window": within_active,
+        "seconds_until_next": seconds_until_next if seconds_until_next is not None else None,
+        "interval_total_seconds": interval_total if interval_total is not None else None,
+        "attempts_last_hour": attempts_last_hour,
+        "attempts_last_day": attempts_last_day,
+        "hourly_max_attempts": _runtime.hourly_max_attempts,
+        "daily_max_attempts": _runtime.daily_max_attempts,
+        "can_attempt_now": bool(can_attempt_now),
+        "wait_seconds_if_capped": int(wait_seconds_if_capped) if wait_seconds_if_capped else 0,
+        "to_number": _runtime.to_number or "",
+        "from_number": _runtime.from_number or "",
+        "from_numbers": list(_runtime.from_numbers or []),
+        "public_base_url": _runtime.public_base_url or "",
+        "active_hours_local": _runtime.active_hours_local or "",
+        "last_error": last_err,
+    }
+    return jsonify(payload)
+
+
+# New: Live transcript and live call info endpoint the frontend polls
+@app.route("/api/live", methods=["GET"])
+def api_live():
+    """
+    Return current live transcript (merged finals plus latest partial) and whether media streams are enabled.
+    The frontend uses this for the live conversation panel and to enable the Listen button.
+    """
+    call_sid = _get_current_call_sid()
+    in_progress = bool(call_sid)
+    with _TRANSCRIPTS_LOCK:
+        transcript = list(_TRANSCRIPTS.get(call_sid, [])) if call_sid else []
+    return jsonify({
+        "in_progress": in_progress,
+        "call_sid": call_sid or "",
+        "media_streams_enabled": bool(_runtime.enable_media_streams),
+        "transcript": transcript,
+    })
 
 
 @app.route("/health", methods=["GET"])
