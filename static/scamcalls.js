@@ -24,7 +24,19 @@
     }[c]));
   }
 
-  // Format seconds to mm:ss
+  // Format seconds to mm:ss or hh:mm:ss for larger values
+  function formatDurationSeconds(totalSeconds) {
+    const s = Math.max(0, Math.floor(totalSeconds || 0));
+    const hours = Math.floor(s / 3600);
+    const minutes = Math.floor((s % 3600) / 60);
+    const seconds = s % 60;
+    if (hours > 0) {
+      return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+    }
+    return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+  }
+
+  // Format seconds to mm:ss (used for countdown)
   function formatMMSS(totalSeconds) {
     const s = Math.max(0, Math.floor(totalSeconds || 0));
     const m = Math.floor(s / 60);
@@ -316,6 +328,7 @@
   // Status poller and UI (countdown + labels)
   // -----------------------
   let statusTimer = null;
+  let metricsTimer = null;
   let callActive = false; // Tracks in-progress state when provided by backend
 
   function renderNumbersLine(data) {
@@ -446,6 +459,54 @@
     statusTimer = setInterval(pollStatusOnce, 1000);
     document.addEventListener("visibilitychange", () => {
       if (!document.hidden) pollStatusOnce();
+    });
+  }
+
+  // -----------------------
+  // Metrics (total calls, total call time)
+  // -----------------------
+  async function fetchMetricsOnce() {
+    try {
+      const res = await fetch("/api/metrics", { method: "GET", cache: "no-cache" });
+      if (!res.ok) return;
+      const data = await res.json();
+      renderMetrics(data);
+    } catch {
+      // ignore transient errors
+    }
+  }
+
+  function renderMetrics(data) {
+    const container = qs("#metricsArea");
+    if (!container) return;
+    const totalCalls = Number(data.total_calls || 0);
+    const totalSeconds = Number(data.total_duration_seconds || 0);
+    const avgSeconds = Number(data.average_call_seconds || 0);
+
+    container.innerHTML = `
+      <div style="display:flex;gap:0.75rem;flex-wrap:wrap;align-items:center">
+        <div style="background:rgba(255,255,255,0.03);padding:0.6rem 0.8rem;border-radius:10px;border:1px solid var(--border);min-width:120px;">
+          <div style="font-size:0.9rem;color:var(--muted)">Total calls</div>
+          <div style="font-size:1.2rem;font-weight:700">${escapeHtml(String(totalCalls))}</div>
+        </div>
+        <div style="background:rgba(255,255,255,0.03);padding:0.6rem 0.8rem;border-radius:10px;border:1px solid var(--border);min-width:160px;">
+          <div style="font-size:0.9rem;color:var(--muted)">Total call time</div>
+          <div style="font-size:1.1rem;font-weight:700">${escapeHtml(formatDurationSeconds(totalSeconds))}</div>
+        </div>
+        <div style="background:rgba(255,255,255,0.03);padding:0.6rem 0.8rem;border-radius:10px;border:1px solid var(--border);min-width:160px;">
+          <div style="font-size:0.9rem;color:var(--muted)">Average</div>
+          <div style="font-size:1.1rem;font-weight:700">${escapeHtml(formatDurationSeconds(avgSeconds))}</div>
+        </div>
+      </div>
+    `;
+  }
+
+  function initMetricsPoll() {
+    fetchMetricsOnce();
+    clearInterval(metricsTimer);
+    metricsTimer = setInterval(fetchMetricsOnce, 5000);
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden) fetchMetricsOnce();
     });
   }
 
@@ -846,6 +907,7 @@
     initCallNow();
     initAdminPanel();
     initStatusPoll();
+    initMetricsPoll();
     initLivePanel();
   });
 })();
