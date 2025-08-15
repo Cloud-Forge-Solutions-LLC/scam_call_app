@@ -212,14 +212,18 @@
     const tbody = document.createElement("tbody");
     items.forEach((row) => {
       const tr = document.createElement("tr");
-      const tdKey = document.createElement("td");
-      const tdVal = document.createElement("td");
 
+      // Key cell: show the key label (on mobile it appears above the input)
+      const tdKey = document.createElement("td");
       const keyLabel = document.createElement("div");
+      keyLabel.className = "env-key";
       keyLabel.textContent = row.key;
-      keyLabel.style.fontFamily = "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace";
-      keyLabel.style.fontSize = "0.95rem";
       tdKey.appendChild(keyLabel);
+
+      // Value cell: input/select/textarea
+      const tdVal = document.createElement("td");
+      const valWrapper = document.createElement("div");
+      valWrapper.className = "env-value";
 
       let input;
       if (row.key.endsWith("_DAYS")) {
@@ -232,7 +236,7 @@
         input.type = "text";
         input.placeholder = "09:00-18:00";
         input.value = row.value ?? "";
-      } else if (row.key.endsWith("_SECONDS")) {
+      } else if (row.key.endsWith("_SECONDS") || row.key.endsWith("_ATTEMPTS") || row.key.endsWith("_PORT")) {
         input = document.createElement("input");
         input.type = "number";
         input.step = "1";
@@ -254,8 +258,15 @@
       }
       input.dataset.key = row.key;
       input.autocomplete = "off";
+      input.className = "env-input";
 
-      tdVal.appendChild(input);
+      // For small screens, preserve visible label near input as well (aria)
+      input.setAttribute("aria-label", row.key);
+
+      valWrapper.appendChild(input);
+      tdVal.appendChild(valWrapper);
+
+      // Attach both cells to the row
       tr.appendChild(tdKey);
       tr.appendChild(tdVal);
       tbody.appendChild(tr);
@@ -273,7 +284,7 @@
     if (!container) return;
     const endpoint = container.getAttribute("data-endpoint-post") || "/api/admin/env";
 
-    const inputs = qsa("input, select, textarea", container);
+    const inputs = qsa("input.env-input, select.env-input, textarea.env-input", container);
     const updates = {};
     inputs.forEach((el) => {
       const key = el.dataset.key;
@@ -403,7 +414,7 @@
       </div>`;
 
     const focal =
-      `<div style="display:flex;align-items:center;gap:1rem;margin-top:.9rem">
+      `<div style="display:flex;align-items:center;gap:1rem;margin-top:.9rem;flex-wrap:wrap">
         <div style="flex:0 0 auto">${svg}</div>
         <div style="flex:1 1 auto">${labelBlock}</div>
       </div>`;
