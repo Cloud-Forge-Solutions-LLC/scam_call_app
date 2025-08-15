@@ -1126,6 +1126,26 @@ def _scan_history_summaries(limit: int = 200) -> List[Dict[str, Any]]:
     return out
 
 
+def _compute_history_metrics() -> Dict[str, Any]:
+    """
+    Compute aggregate metrics from stored history files:
+    - total_calls: number of history files
+    - total_duration_seconds: sum of duration_seconds where present
+    - average_call_seconds: computed if total_calls > 0
+    """
+    summaries = _scan_history_summaries(limit=1000000)
+    total_calls = len(summaries)
+    total_duration = 0
+    for s in summaries:
+        try:
+            ds = int(s.get("duration_seconds") or 0)
+        except Exception:
+            ds = 0
+        total_duration += ds
+    avg = int(total_duration / total_calls) if total_calls else 0
+    return {"total_calls": total_calls, "total_duration_seconds": total_duration, "average_call_seconds": avg}
+
+
 def _log_runtime_summary(context: str = "startup") -> None:
     ready, reasons = _diagnostics_ready_to_call()
     log.info(
@@ -2014,6 +2034,35 @@ def api_live():
         "media_streams_enabled": bool(_runtime.enable_media_streams),
         "transcript": transcript,
     })
+
+
+# New: History endpoints (used by history UI and to compute metrics)
+@app.route("/api/history", methods=["GET"])
+def api_history_list():
+    try:
+        calls = _scan_history_summaries(limit=1000)
+        return jsonify({"calls": calls})
+    except Exception:
+        return jsonify({"calls": []})
+
+
+@app.route("/api/history/<sid>", methods=["GET"])
+def api_history_get(sid: str):
+    d = _load_call_history(sid)
+    if not d:
+        return Response("Not found", status=404)
+    return jsonify(d)
+
+
+# New: Metrics endpoint used to drive summary graphics (total calls, total call time)
+@app.route("/api/metrics", methods=["GET"])
+def api_metrics():
+    try:
+        metrics = _compute_history_metrics()
+        return jsonify(metrics)
+    except Exception as e:
+        log.exception("Failed computing metrics: %s", e)
+        return jsonify({"total_calls": 0, "total_duration_seconds": 0, "average_call_seconds": 0})
 
 
 @app.route("/health", methods=["GET"])
