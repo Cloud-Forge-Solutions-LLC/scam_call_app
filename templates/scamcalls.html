@@ -14,38 +14,42 @@
   <main class="page-container">
     <header class="page-header">
       <h1 class="app-title">Scam Call Console</h1>
-      <nav class="header-actions">
-        <a class="btn btn-secondary" href="/scamcalls/history">History</a>
+      <nav class="header-actions" aria-label="Primary actions">
+        <a class="btn btn-secondary" href="/scamcalls/history" title="View call history">History</a>
         {% if is_admin %}
-          <a class="btn btn-secondary" href="/admin/logout" id="btnLogout">Logout</a>
+          <a class="btn btn-secondary" href="/admin/logout" id="btnLogout" title="Log out">Logout</a>
         {% else %}
-          <a class="btn btn-secondary" href="/admin/login" id="btnAdminLogin">Admin</a>
+          <a class="btn btn-secondary" href="/admin/login" id="btnAdminLogin" title="Administrator login">Admin</a>
         {% endif %}
       </nav>
     </header>
 
-    <section class="card">
-      <div class="controls-row">
-        <button id="btnCallNow" class="btn btn-primary" type="button">Call now</button>
-        <button id="btnAddGreeting" class="btn" type="button">Add greeting phrase</button>
+    <section class="card" role="region" aria-labelledby="console-controls">
+      <div class="controls-row" id="console-controls">
+        <button id="btnCallNow" class="btn btn-primary" type="button" aria-label="Call now">Call now</button>
+        <button id="btnAddGreeting" class="btn" type="button" aria-label="Add greeting phrase">Add greeting phrase</button>
+
+        <!-- Links to related pages (speech settings, caller messages) -->
+        <a class="btn btn-secondary" href="/scamcalls/speech" id="btnSpeechSettings" role="button" aria-label="Speech settings">Speech settings</a>
+        <a class="btn btn-secondary" href="/scamcalls/messages" id="btnMessages" role="button" aria-label="Caller messages">Caller messages</a>
       </div>
 
-      <div id="statusArea" class="status-area" aria-live="polite"></div>
+      <div id="statusArea" class="status-area" aria-live="polite" aria-atomic="true"></div>
 
       {% if is_admin %}
       <hr />
-      <section id="adminPanel" class="admin-panel">
+      <section id="adminPanel" class="admin-panel" aria-labelledby="admin-panel-title">
         <div class="admin-panel__header">
-          <h2>Admin Settings</h2>
+          <h2 id="admin-panel-title">Admin Settings</h2>
           <p class="muted">
             Update non-secret configuration values. Values are loaded from the server and persisted back to .env.
           </p>
         </div>
         <!-- envEditor is rendered by JS as a responsive table on desktop and stacked cards on mobile -->
-        <div id="envEditor" class="env-editor" data-endpoint-get="/api/admin/env" data-endpoint-post="/api/admin/env" aria-busy="true">
-          <div class="skeleton-row"></div>
-          <div class="skeleton-row"></div>
-          <div class="skeleton-row"></div>
+        <div id="envEditor" class="env-editor" data-endpoint-get="/api/admin/env" data-endpoint-post="/api/admin/env" aria-busy="true" aria-live="polite">
+          <div class="skeleton-row" aria-hidden="true"></div>
+          <div class="skeleton-row" aria-hidden="true"></div>
+          <div class="skeleton-row" aria-hidden="true"></div>
         </div>
         <div class="form-actions">
           <button id="btnSaveEnv" class="btn btn-primary" type="button" disabled>Save settings</button>
@@ -55,7 +59,7 @@
     </section>
 
     <div id="greetingModal" class="modal" aria-hidden="true" role="dialog" aria-modal="true" aria-labelledby="greetingModalTitle">
-      <div class="modal__dialog">
+      <div class="modal__dialog" role="document">
         <div class="modal__header">
           <h3 id="greetingModalTitle">One-time greeting phrase</h3>
           <button class="modal__close" type="button" aria-label="Close" id="greetingCloseBtn">×</button>
