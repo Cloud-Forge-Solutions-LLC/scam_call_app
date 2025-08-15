@@ -28,49 +28,49 @@
       <div class="form-grid" style="grid-template-columns: 1fr 1fr; gap: 1rem;">
         <div>
           <label for="voiceSelect">Voice</label>
-          <select id="voiceSelect"></select>
+          <select id="voiceSelect" style="width:100%;"></select>
           <div class="form-help">Choose a voice. Amazon Polly voices support prosody controls.</div>
         </div>
 
         <div>
           <label for="languageSelect">Language</label>
-          <select id="languageSelect"></select>
+          <select id="languageSelect" style="width:100%;"></select>
           <div class="form-help">Language used for speech recognition and synthesis.</div>
         </div>
 
         <div>
           <label for="rateInput">Speaking rate: <span id="rateValue">100%</span></label>
-          <input id="rateInput" type="range" min="50" max="200" step="1" />
+          <input id="rateInput" type="range" min="50" max="200" step="1" style="width:100%;" />
           <div class="form-help">Adjust the reading speed (50% to 200%).</div>
         </div>
 
         <div>
           <label for="pitchInput">Pitch: <span id="pitchValue">0 st</span></label>
-          <input id="pitchInput" type="range" min="-12" max="12" step="1" />
+          <input id="pitchInput" type="range" min="-12" max="12" step="1" style="width:100%;" />
           <div class="form-help">Semitone adjustment (-12 to +12). Requires Polly voice.</div>
         </div>
 
         <div>
           <label for="volumeInput">Volume: <span id="volumeValue">0 dB</span></label>
-          <input id="volumeInput" type="range" min="-6" max="6" step="1" />
+          <input id="volumeInput" type="range" min="-6" max="6" step="1" style="width:100%;" />
           <div class="form-help">Relative loudness (-6 dB to +6 dB). Requires Polly voice.</div>
         </div>
 
         <div>
           <label for="greetPauseInput">Greeting pause between lines (s)</label>
-          <input id="greetPauseInput" type="number" min="0" max="5" step="0.1" />
+          <input id="greetPauseInput" type="number" min="0" max="5" step="0.1" style="width:100%;" />
           <div class="form-help">Pause inserted between greeting lines.</div>
         </div>
 
         <div>
           <label for="respPauseInput">Pause before response (s)</label>
-          <input id="respPauseInput" type="number" min="0" max="5" step="0.1" />
+          <input id="respPauseInput" type="number" min="0" max="5" step="0.1" style="width:100%;" />
           <div class="form-help">Pause before the caller responds after the callee speaks.</div>
         </div>
 
         <div>
           <label for="betweenPauseInput">Pause between phrases (s)</label>
-          <input id="betweenPauseInput" type="number" min="0" max="5" step="0.1" />
+          <input id="betweenPauseInput" type="number" min="0" max="5" step="0.1" style="width:100%;" />
           <div class="form-help">Pause inserted between multiple phrases in a single response.</div>
         </div>
       </div>
