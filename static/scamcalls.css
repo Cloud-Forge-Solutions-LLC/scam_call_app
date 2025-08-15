@@ -1,4 +1,4 @@
-√:root {
+:root {
   --bg: rgba(0, 0, 0, 0.55);
   --card: rgba(20, 22, 26, 0.75);
   --text: #f3f5f7;
@@ -37,7 +37,8 @@ body {
   z-index: 2;
   min-height: 100%;
   padding: 1rem;
-  background: linear-gradient(to bottom, rgba(0,0,0,0.25), rgba(0,0,0,0.6));
+  /* Removed the dark overlay to restore the lighter, glassy UI */
+  background: none;
 }
 
 .page-header {
