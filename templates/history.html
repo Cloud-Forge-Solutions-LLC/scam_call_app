@@ -1,116 +1,326 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="utf-8">
-  <title>Call History - Scam Call Console</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Call History</title>
+  <link rel="icon" href="/static/favicon.svg" />
   <link rel="stylesheet" href="/static/scamcalls.css" />
   <link rel="stylesheet" href="/static/css/matrix.css" />
+
+  <!-- Typography: high-quality, readable sans and crisp rendering -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" crossorigin />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+
   <style>
-    /* keep per-page minimal overrides here (if any) */
+    /* Page-level layout: fill viewport and allow only the calls list to scroll */
+    .page-container {
+      display: flex;
+      flex-direction: column;
+      height: 100vh;          /* lock to viewport */
+      overflow: hidden;       /* prevent body scrolling; we'll scroll the left column only */
+      padding: 1rem;          /* keep same spacing as other pages */
+    }
+
+    /* Typography improvements (reduce “blocky” appearance) */
+    body, .card, table, .details, .page-header, .app-title, .header-actions {
+      font-family: Inter, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans", "Liberation Sans", sans-serif;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+      text-rendering: optimizeLegibility;
+      letter-spacing: 0.005em;
+    }
+    .page-header .app-title {
+      font-weight: 600;
+      letter-spacing: 0.01em;
+    }
+    table.history th {
+      font-weight: 600;
+      color: var(--muted);
+    }
+    table.history td {
+      font-weight: 400;
+    }
+    /* Align numeric columns neatly */
+    .col-num {
+      font-variant-numeric: tabular-nums;
+    }
+
+    /* Two-column content area fills remaining vertical space */
+    .history-layout {
+      flex: 1 1 auto;
+      min-height: 0;          /* enable children to shrink and scroll */
+      display: grid;
+      grid-template-columns: 2fr 1fr;
+      gap: 1rem;
+      margin: 0 auto;
+      max-width: 1100px;
+      width: 100%;
+    }
+
+    /* Left: Calls panel (this is the only scrollable column) */
+    .calls-panel {
+      display: flex;
+      flex-direction: column;
+      min-height: 0;          /* allow inner scroll area to size properly */
+    }
+    .calls-panel__header {
+      margin: 0 0 0.5rem 0;
+      font-size: 1.05rem;
+      font-weight: 600;
+      letter-spacing: 0.01em;
+    }
+    .calls-panel__scroll {
+      flex: 1 1 auto;
+      min-height: 0;
+      overflow-y: auto;       /* independent scrolling here */
+      overflow-x: hidden;
+      border-radius: 8px;
+    }
+
+    /* Table styling inside the scroll area */
+    table.history {
+      width: 100%;
+      border-collapse: collapse;
+    }
+    table.history th, table.history td {
+      padding: 0.65rem 0.7rem;
+      border-bottom: 1px solid var(--border);
+      text-align: left;
+      vertical-align: top;
+      font-size: 0.96rem;
+      line-height: 1.45;
+    }
+    table.history thead th {
+      position: sticky;       /* header stays visible while the list scrolls */
+      top: 0;
+      background: var(--card); /* match card background so it looks continuous */
+      z-index: 1;
+    }
+    .history__sid a {
+      color: #8fd1ff;
+      text-decoration: none;
+      word-break: break-all;
+      font-weight: 500;
+    }
+    .history__sid a:hover,
+    .history__sid a:focus {
+      text-decoration: underline;
+    }
+
+    /* Right: Details panel stays visible (page itself does not scroll).
+       If content gets long, the panel itself can scroll internally. */
+    .details-panel {
+      display: flex;
+      flex-direction: column;
+      max-height: 100%;
+      overflow: auto;         /* only if transcript gets long */
+    }
+    .details {
+      min-height: 6rem;
+      color: var(--text);
+      font-size: 0.98rem;
+      line-height: 1.5;
+      letter-spacing: 0.005em;
+    }
+    .details h4 {
+      margin: 0.75rem 0 0.35rem 0;
+      font-size: 1rem;
+      color: var(--muted);
+      font-weight: 600;
+    }
+    .details audio {
+      width: 100%;
+      margin: 0.25rem 0 0.5rem 0;
+    }
+    .details pre {
+      white-space: pre-wrap;
+      background: rgba(255,255,255,0.03);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 0.6rem 0.7rem;
+      font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      font-size: 0.92rem;
+      line-height: 1.45;
+      margin: 0.25rem 0 0 0;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+      text-rendering: optimizeLegibility;
+    }
+    .muted-inline {
+      color: var(--muted);
+    }
+
+    /* Visually hidden utility for accessible headings */
+    .visually-hidden {
+      position: absolute !important;
+      height: 1px; width: 1px;
+      overflow: hidden;
+      clip: rect(1px, 1px, 1px, 1px);
+      white-space: nowrap;
+    }
+
+    /* Responsive: stack on narrow screens; both sections will scroll if needed */
+    @media (max-width: 980px) {
+      .history-layout {
+        grid-template-columns: 1fr;
+      }
+    }
   </style>
 </head>
-<body>
-<header>
-  <h1>Call History</h1>
-  <div>
-    <a class="btn secondary" href="/scamcalls">Back</a>
-  </div>
-</header>
-<main class="grid" style="max-width:1100px;margin:24px auto;padding:0 16px;">
-  <div class="card">
-    <h3>Calls</h3>
-    <table id="callsTable">
-      <thead>
-        <tr>
-          <th>When</th>
-          <th>SID</th>
-          <th>To</th>
-          <th>From</th>
-          <th>Duration</th>
-          <th>Recordings</th>
-        </tr>
-      </thead>
-      <tbody id="callsBody"></tbody>
-    </table>
-  </div>
-  <div class="card">
-    <h3>Details</h3>
-    <div id="details">Select a call.</div>
-  </div>
-</main>
+<body class="matrix-bg">
+  <canvas id="matrix-canvas" aria-hidden="true"></canvas>
 
-<script>
-function fmtTs(ts) {
-  if (!ts) return '';
-  const d = new Date(ts * 1000);
-  return d.toLocaleString();
-}
-function fmtDur(s) {
-  if (s == null) return '';
-  const m = Math.floor(s / 60);
-  const r = s % 60;
-  return `${m}m ${r}s`;
-}
+  <main class="page-container">
+    <header class="page-header">
+      <h1 class="app-title">Call History</h1>
+      <nav class="header-actions" aria-label="Primary actions">
+        <a class="btn btn-secondary" href="/scamcalls" title="Back to console">Back</a>
+      </nav>
+    </header>
 
-async function loadCalls() {
-  const r = await fetch('/api/history');
-  if (!r.ok) return;
-  const data = await r.json();
-  const body = document.getElementById('callsBody');
-  body.innerHTML = '';
-  (data.calls || []).forEach(c => {
-    const tr = document.createElement('tr');
-    tr.innerHTML = `
-      <td>${fmtTs(c.started_at)}</td>
-      <td><a href="#" data-sid="${c.sid}">${c.sid}</a></td>
-      <td>${c.to || ''}</td>
-      <td>${c.from || ''}</td>
-      <td>${fmtDur(c.duration_seconds)}</td>
-      <td>${c.has_recordings ? 'Yes' : 'No'}</td>
-    `;
-    body.appendChild(tr);
-  });
-  body.querySelectorAll('a[data-sid]').forEach(a => {
-    a.addEventListener('click', async (ev) => {
-      ev.preventDefault();
-      const sid = a.getAttribute('data-sid');
-      await loadDetails(sid);
-    });
-  });
-}
+    <div class="history-layout">
+      <!-- Left: Calls (scrolls independently) -->
+      <section class="card calls-panel" role="region" aria-labelledby="calls-title">
+        <h2 id="calls-title" class="calls-panel__header">Calls</h2>
+        <div class="calls-panel__scroll">
+          <table class="history" id="callsTable" aria-describedby="calls-help">
+            <thead>
+              <tr>
+                <th scope="col">When</th>
+                <th scope="col">SID</th>
+                <th scope="col">To</th>
+                <th scope="col">From</th>
+                <th scope="col" class="col-num">Duration</th>
+                <th scope="col">Recordings</th>
+              </tr>
+            </thead>
+            <tbody id="callsBody">
+              <tr><td colspan="6" class="muted-inline">Loading…</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div id="calls-help" class="muted" style="margin-top:0.5rem;">Select a SID to view details and transcript.</div>
+      </section>
 
-async function loadDetails(sid) {
-  const r = await fetch('/api/history/' + sid);
-  if (!r.ok) return;
-  const d = await r.json();
-  const meta = d.meta || {};
-  const tx = d.transcript || [];
-  let html = '';
-  html += `<div><strong>SID:</strong> ${d.sid}</div>`;
-  html += `<div><strong>To:</strong> ${meta.to || ''} <strong>From:</strong> ${meta.from || ''}</div>`;
-  html += `<div><strong>Started:</strong> ${fmtTs(meta.started_at)} <strong>Completed:</strong> ${fmtTs(meta.completed_at)}</div>`;
-  html += `<div><strong>Voice:</strong> ${meta.voice || ''} <strong>Dialog Index:</strong> ${meta.dialog_idx ?? ''}</div>`;
-  if ((meta.recordings || []).length) {
-    html += `<h4>Recordings</h4>`;
-    (meta.recordings || []).forEach(r => {
-      const src = '/api/recording/' + r.recording_sid;
-      html += `<div><audio controls src="${src}"></audio> <small>Recording SID: ${r.recording_sid}</small></div>`;
-    });
-  }
-  html += `<h4>Transcript</h4>`;
-  html += '<pre>' + tx.map(e => {
-    const role = e.role || '';
-    const text = e.text || '';
-    const prefix = role === 'Assistant' ? 'Assistant: ' : (role === 'Callee' ? 'Callee: ' : '');
-    return prefix + text;
-  }).join('\n') + '</pre>';
-  document.getElementById('details').innerHTML = html;
-}
+      <!-- Right: Details (stays visible at the top) -->
+      <aside class="card details-panel" role="region" aria-labelledby="details-title">
+        <h2 id="details-title" class="visually-hidden">Details</h2>
+        <div id="details" class="details muted">Select a call.</div>
+      </aside>
+    </div>
+  </main>
 
-loadCalls();
-</script>
+  <script>
+    (function () {
+      "use strict";
 
-<script src="/static/js/theme-enhance.js"></script>
+      function fmtTs(ts) {
+        if (!ts && ts !== 0) return "";
+        try {
+          const d = new Date(Number(ts) * 1000);
+          return d.toLocaleString();
+        } catch {
+          return "";
+        }
+      }
+
+      function fmtDur(s) {
+        if (s == null) return "";
+        const total = Math.max(0, Number(s) || 0);
+        const m = Math.floor(total / 60);
+        const r = total % 60;
+        return m + "m " + r + "s";
+      }
+
+      async function loadCalls() {
+        const body = document.getElementById("callsBody");
+        try {
+          const r = await fetch("/api/history");
+          if (!r.ok) throw new Error(String(r.status));
+          const data = await r.json();
+          const calls = Array.isArray(data.calls) ? data.calls : [];
+          body.innerHTML = "";
+          if (calls.length === 0) {
+            body.innerHTML = '<tr><td colspan="6" class="muted-inline">No calls yet.</td></tr>';
+            return;
+          }
+          for (const c of calls) {
+            const tr = document.createElement("tr");
+            tr.innerHTML = `
+              <td>${fmtTs(c.started_at)}</td>
+              <td class="history__sid"><a href="#" data-sid="${(c.sid || "").replace(/"/g, "&quot;")}">${c.sid || ""}</a></td>
+              <td>${c.to ? String(c.to) : ""}</td>
+              <td>${c.from ? String(c.from) : ""}</td>
+              <td class="col-num">${fmtDur(c.duration_seconds)}</td>
+              <td>${c.has_recordings ? "Yes" : "No"}</td>
+            `;
+            body.appendChild(tr);
+          }
+          body.querySelectorAll("a[data-sid]").forEach(a => {
+            a.addEventListener("click", ev => {
+              ev.preventDefault();
+              const sid = a.getAttribute("data-sid") || "";
+              if (sid) loadDetails(sid);
+            });
+          });
+        } catch {
+          body.innerHTML = '<tr><td colspan="6" class="muted-inline">Failed to load.</td></tr>';
+        }
+      }
+
+      async function loadDetails(sid) {
+        const details = document.getElementById("details");
+        details.textContent = "Loading…";
+        try {
+          const r = await fetch("/api/history/" + encodeURIComponent(sid));
+          if (!r.ok) throw new Error(String(r.status));
+          const d = await r.json();
+          const meta = d.meta || {};
+          const tx = Array.isArray(d.transcript) ? d.transcript : [];
+          const recs = Array.isArray(meta.recordings) ? meta.recordings : [];
+
+          let html = "";
+          html += `<div><strong>SID:</strong> ${d.sid || ""}</div>`;
+          html += `<div><strong>To:</strong> ${meta.to || ""} <strong>From:</strong> ${meta.from || ""}</div>`;
+          html += `<div><strong>Started:</strong> ${fmtTs(meta.started_at)} <strong>Completed:</strong> ${fmtTs(meta.completed_at)}</div>`;
+          if (meta.voice) html += `<div><strong>Voice:</strong> ${meta.voice}</div>`;
+          if (typeof meta.dialog_idx !== "undefined" && meta.dialog_idx !== null) {
+            html += `<div><strong>Dialog Index:</strong> ${meta.dialog_idx}</div>`;
+          }
+
+          if (recs.length) {
+            html += `<h4>Recordings</h4>`;
+            for (const r of recs) {
+              const src = "/api/recording/" + encodeURIComponent(r.recording_sid || "");
+              html += `<div><audio controls src="${src}"></audio><div class="muted-inline">Recording SID: ${r.recording_sid || ""}</div></div>`;
+            }
+          }
+
+          html += `<h4>Transcript</h4>`;
+          if (tx.length) {
+            const lines = tx.map(e => {
+              const role = e.role || "";
+              const text = e.text || "";
+              return (role ? role + ": " : "") + text;
+            }).join("\n");
+            const esc = s => s.replace(/[&<>]/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;" }[c]));
+            html += `<pre>${esc(lines)}</pre>`;
+          } else {
+            html += `<div class="muted-inline">No transcript captured.</div>`;
+          }
+
+          details.innerHTML = html;
+        } catch {
+          details.innerHTML = `<div class="muted-inline">Failed to load details.</div>`;
+        }
+      }
+
+      document.addEventListener("DOMContentLoaded", () => {
+        loadCalls();
+      });
+    })();
+  </script>
 </body>
 </html>
