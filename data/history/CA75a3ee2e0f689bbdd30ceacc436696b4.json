@@ -1,0 +1,50 @@
+{
+  "sid": "CA75a3ee2e0f689bbdd30ceacc436696b4",
+  "meta": {
+    "to": "+18319460285",
+    "from_n": "+12093202395",
+    "started_at": 1755278981,
+    "completed_at": 1755278999,
+    "duration_seconds": 16,
+    "voice": "woman",
+    "dialog_idx": 5
+  },
+  "transcript": [
+    {
+      "t": 1755278988.204423,
+      "role": "Callee",
+      "text": "if you're",
+      "final": false
+    },
+    {
+      "t": 1755278992.127855,
+      "role": "Callee",
+      "text": "Hello.",
+      "final": false
+    },
+    {
+      "t": 1755278992.671341,
+      "role": "Callee",
+      "text": "Hello.",
+      "final": false
+    },
+    {
+      "t": 1755278995.1029687,
+      "role": "Callee",
+      "text": "hello,  say",
+      "final": false
+    },
+    {
+      "t": 1755278995.1872466,
+      "role": "Callee",
+      "text": "Hello,  say something.",
+      "final": false
+    },
+    {
+      "t": 1755278995.5085814,
+      "role": "Callee",
+      "text": "Hello, say something.",
+      "final": true
+    }
+  ]
+}

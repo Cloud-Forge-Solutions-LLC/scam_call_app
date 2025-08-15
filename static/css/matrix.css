@@ -1,8 +1,13 @@
 /* Full-screen canvas background for Matrix effect */
 .matrix-bg {
-  background: #0b0f10;
+  background: #061014;
+  color: #e6fff6;
+  min-height: 100%;
+  position: relative;
+  overflow: hidden;
 }
 
+/* Canvas itself */
 #matrix-canvas {
   position: fixed;
   inset: 0;
@@ -10,9 +15,68 @@
   height: 100%;
   z-index: 0;
   display: block;
-  background: radial-gradient(1200px 800px at 10% 10%, rgba(0, 60, 40, 0.12), rgba(0, 0, 0, 0)) fixed,
-              radial-gradient(1200px 800px at 90% 90%, rgba(0, 60, 40, 0.12), rgba(0, 0, 0, 0)) fixed;
+  background:
+    radial-gradient(1200px 800px at 10% 10%, rgba(0, 80, 55, 0.06), rgba(0, 0, 0, 0)),
+    radial-gradient(1200px 800px at 90% 90%, rgba(0, 30, 80, 0.04), rgba(0, 0, 0, 0));
+  mix-blend-mode: screen;
 }
 
 /* Ensure content sits above the canvas */
 .page-container { position: relative; z-index: 2; }
+
+/* Subtle grain overlay to give texture */
+.matrix-bg::after {
+  content: "";
+  pointer-events: none;
+  position: fixed;
+  inset: 0;
+  z-index: 1;
+  background-image: linear-gradient(0deg, rgba(255,255,255,0.01), rgba(255,255,255,0.00));
+  opacity: 0.9;
+  mix-blend-mode: overlay;
+}
+
+/* Slight scanlines that shift with JS */
+.matrix-bg .scanlines {
+  pointer-events: none;
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  background-image: linear-gradient(rgba(255,255,255,0.01) 1px, transparent 1px);
+  background-size: 100% 2.8px;
+  opacity: 0.05;
+  transform-origin: center;
+  transition: opacity 260ms ease, transform 260ms ease;
+}
+
+/* Vignette, glow layers used by layout */
+.background-effects .glow {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background:
+    radial-gradient(600px 400px at 20% 20%, rgba(37,194,160,0.06), transparent 12%),
+    radial-gradient(800px 480px at 85% 85%, rgba(126,90,255,0.03), transparent 8%);
+  mix-blend-mode: screen;
+  opacity: 0.95;
+}
+
+/* Small animated accent layer */
+.background-effects .grid {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background-image: linear-gradient(90deg, rgba(255,255,255,0.01) 1px, transparent 1px);
+  background-size: 120px 120px;
+  opacity: 0.03;
+  transform-origin: center;
+  transition: transform 260ms ease;
+}
+
+/* Make the top-left logo feel neon on the matrix background */
+.brand .logo { filter: drop-shadow(0 6px 18px rgba(0,0,0,0.6)); color: var(--accent); }
+
+/* Slightly increase contrast for admin login card */
+.admin-panel__header h2 { color: #fff; }

@@ -1,0 +1,56 @@
+{
+  "sid": "CA63a100f13dc9afbe80327d75fc7c765c",
+  "meta": {
+    "to": "+18319460285",
+    "from_n": "+19162487450",
+    "started_at": 1755278494,
+    "completed_at": 1755278504,
+    "duration_seconds": 9,
+    "voice": "woman",
+    "dialog_idx": 5
+  },
+  "transcript": [
+    {
+      "t": 1755278499.9240575,
+      "role": "Callee",
+      "text": "Can.",
+      "final": false
+    },
+    {
+      "t": 1755278500.0714138,
+      "role": "Callee",
+      "text": "Can I?",
+      "final": false
+    },
+    {
+      "t": 1755278500.149404,
+      "role": "Callee",
+      "text": "Can I help you?",
+      "final": false
+    },
+    {
+      "t": 1755278500.5122159,
+      "role": "Callee",
+      "text": "Can  I help you?",
+      "final": false
+    },
+    {
+      "t": 1755278500.6092646,
+      "role": "Callee",
+      "text": "Can I  help you?",
+      "final": false
+    },
+    {
+      "t": 1755278500.718133,
+      "role": "Callee",
+      "text": "Can I help you?",
+      "final": false
+    },
+    {
+      "t": 1755278503.1360018,
+      "role": "Callee",
+      "text": "Can I help you?",
+      "final": true
+    }
+  ]
+}

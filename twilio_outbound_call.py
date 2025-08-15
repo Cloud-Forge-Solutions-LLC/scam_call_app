@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import atexit
 import base64
+import csv
 import json
 import logging
 import os
@@ -204,6 +205,8 @@ _overlay_env_from_dotenv(".env")
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
+# Legacy CSV history path (compatibility)
+HISTORY_CSV_PATH = DATA_DIR / "call_history.csv"
 
 @dataclass
 class RuntimeConfig:
@@ -1097,32 +1100,109 @@ def _load_call_history(sid: str) -> Optional[Dict[str, Any]]:
 
 
 def _scan_history_summaries(limit: int = 200) -> List[Dict[str, Any]]:
-    items: List[Tuple[float, Path]] = []
+    """
+    Collect history items from the JSON history directory and optionally from a legacy CSV.
+
+    Each item is a summary object with keys:
+      - sid
+      - started_at (epoch seconds, int or None)
+      - completed_at (epoch seconds, int or None)
+      - to
+      - from
+      - duration_seconds (int)
+      - has_recordings (bool)
+    """
+    items: List[Tuple[float, Dict[str, Any]]] = []
+    seen_sids: Set[str] = set()
     try:
         for f in HISTORY_DIR.glob("*.json"):
             try:
-                items.append((f.stat().st_mtime, f))
+                d = json.loads(f.read_text(encoding="utf-8"))
+                meta = d.get("meta", {}) or {}
+                sid = d.get("sid", "") or ""
+                started = meta.get("started_at")
+                try:
+                    started_val = int(started) if started is not None else None
+                except Exception:
+                    started_val = None
+                out = {
+                    "sid": sid,
+                    "started_at": started_val,
+                    "completed_at": meta.get("completed_at"),
+                    "to": meta.get("to"),
+                    "from": meta.get("from"),
+                    "duration_seconds": meta.get("duration_seconds"),
+                    "has_recordings": bool(meta.get("recordings")),
+                }
+                mtime = f.stat().st_mtime
+                items.append((mtime, out))
+                if sid:
+                    seen_sids.add(sid)
             except Exception:
                 continue
     except Exception:
         return []
+
+    # Now read legacy CSV history if present (avoid duplicates by SID)
+    try:
+        if HISTORY_CSV_PATH.exists():
+            try:
+                with HISTORY_CSV_PATH.open("r", encoding="utf-8", newline="") as csvf:
+                    reader = csv.DictReader(csvf)
+                    for r in reader:
+                        sid = (r.get("callSid") or r.get("callSid".lower()) or "").strip()
+                        if not sid:
+                            continue
+                        if sid in seen_sids:
+                            # prefer JSON version
+                            continue
+                        # parse startedAt (ISO8601 or epoch)
+                        started_raw = r.get("startedAt") or r.get("started_at") or ""
+                        started_at = None
+                        if started_raw:
+                            started_raw = started_raw.strip()
+                            try:
+                                # Attempt ISO parse
+                                dt = datetime.fromisoformat(started_raw)
+                                started_at = int(dt.timestamp())
+                            except Exception:
+                                try:
+                                    # fallback numeric epoch
+                                    started_at = int(float(started_raw))
+                                except Exception:
+                                    started_at = None
+                        # duration
+                        dur = 0
+                        try:
+                            dur = int(float(r.get("durationSec") or r.get("duration_sec") or r.get("duration") or 0))
+                        except Exception:
+                            dur = 0
+                        out = {
+                            "sid": sid,
+                            "started_at": started_at,
+                            "completed_at": None,
+                            "to": r.get("to") or "",
+                            "from": r.get("from") or "",
+                            "duration_seconds": dur,
+                            "has_recordings": False,
+                        }
+                        # use file mtime as ordering hint
+                        try:
+                            mtime = HISTORY_CSV_PATH.stat().st_mtime
+                        except Exception:
+                            mtime = time.time()
+                        items.append((mtime, out))
+                        seen_sids.add(sid)
+            except Exception as e:
+                log.warning("Failed to read legacy history CSV %s: %s", HISTORY_CSV_PATH, e)
+    except Exception:
+        pass
+
+    # sort by mtime desc
     items.sort(key=lambda t: t[0], reverse=True)
     out: List[Dict[str, Any]] = []
-    for _, f in items[:limit]:
-        try:
-            d = json.loads(f.read_text(encoding="utf-8"))
-            meta = d.get("meta", {}) or {}
-            out.append({
-                "sid": d.get("sid", ""),
-                "started_at": meta.get("started_at"),
-                "completed_at": meta.get("completed_at"),
-                "to": meta.get("to"),
-                "from": meta.get("from"),
-                "duration_seconds": meta.get("duration_seconds"),
-                "has_recordings": bool(meta.get("recordings")),
-            })
-        except Exception:
-            continue
+    for _, obj in items[:limit]:
+        out.append(obj)
     return out
 
 
@@ -2038,7 +2118,7 @@ def api_live():
 
 # New: History endpoints (used by history UI and to compute metrics)
 @app.route("/api/history", methods=["GET"])
-def api_history_list():
+def api_history():
     try:
         calls = _scan_history_summaries(limit=1000)
         return jsonify({"calls": calls})
@@ -2087,3 +2167,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

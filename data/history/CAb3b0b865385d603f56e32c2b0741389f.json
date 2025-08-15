@@ -1,0 +1,50 @@
+{
+  "sid": "CAb3b0b865385d603f56e32c2b0741389f",
+  "meta": {
+    "to": "+18319460285",
+    "from_n": "+19162487450",
+    "started_at": 1755272155,
+    "completed_at": 1755272168,
+    "duration_seconds": 10,
+    "voice": "man",
+    "dialog_idx": 2
+  },
+  "transcript": [
+    {
+      "t": 1755272164.1349947,
+      "role": "Callee",
+      "text": "How?",
+      "final": false
+    },
+    {
+      "t": 1755272164.270065,
+      "role": "Callee",
+      "text": "How can?",
+      "final": false
+    },
+    {
+      "t": 1755272164.3677964,
+      "role": "Callee",
+      "text": "How can I?",
+      "final": false
+    },
+    {
+      "t": 1755272164.45372,
+      "role": "Callee",
+      "text": "How can I help?",
+      "final": false
+    },
+    {
+      "t": 1755272164.4667032,
+      "role": "Callee",
+      "text": "How can I help you?",
+      "final": false
+    },
+    {
+      "t": 1755272164.536498,
+      "role": "Callee",
+      "text": "How can I help you?",
+      "final": true
+    }
+  ]
+}
