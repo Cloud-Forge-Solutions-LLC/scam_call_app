@@ -3,3 +3,5 @@
 .env*
 scam_app.db
 *.db
+scam_app.db-wal
+scam_app.db-shm
