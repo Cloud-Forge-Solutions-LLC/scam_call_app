@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Scam Text Console</title>
+  <link rel="icon" href="/static/favicon.svg" />
+  <link rel="stylesheet" href="/static/scamcalls.css" />
+  <link rel="stylesheet" href="/static/css/matrix.css" />
+  <link rel="stylesheet" href="/static/scamtexts.css" />
+</head>
+<body class="matrix-bg" data-is-admin="{{ '1' if is_admin else '0' }}">
+  <canvas id="matrix-canvas" aria-hidden="true"></canvas>
+
+  <main class="page-container">
+    <header class="page-header">
+      <h1 class="app-title"><span class="brand-mark">SC</span> Scam Text Console</h1>
+      <nav class="header-actions" aria-label="Primary actions">
+        <a class="btn btn-secondary" href="/scamtexts/history" title="View text history">History</a>
+        <a class="btn btn-secondary" href="/scamcalls" title="Switch to calls">Calls</a>
+        {% if is_admin %}
+          <a class="btn btn-secondary" href="/admin/logout" id="btnLogout" title="Log out">Logout</a>
+        {% else %}
+          <a class="btn btn-secondary" href="/admin/login" id="btnAdminLogin" title="Administrator login">Admin</a>
+        {% endif %}
+      </nav>
+    </header>
+
+    <section class="card" role="region" aria-labelledby="console-controls">
+      <div class="controls-row" id="console-controls">
+        <button id="btnSendNow" class="btn btn-primary" type="button" aria-label="Send now">Send now</button>
+        <button id="btnAddOpening" class="btn" type="button" aria-label="Add opening phrase">Add opening phrase</button>
+      </div>
+
+      <div id="metricsArea" style="margin-top:0.8rem;"></div>
+      <div id="statusArea" class="status-area" aria-live="polite" aria-atomic="true"></div>
+
+      {% if is_admin %}
+      <hr />
+      <section id="adminPanel" class="admin-panel" aria-labelledby="admin-panel-title">
+        <div class="admin-panel__header">
+          <h2 id="admin-panel-title">Admin Settings</h2>
+          <p class="muted">
+            Update non-secret configuration values. Values are loaded from the server and persisted back to .env.
+          </p>
+        </div>
+        <div id="envEditor"></div>
+        <div class="admin-panel__actions">
+          <button id="btnSaveEnv" class="btn btn-primary">Save settings</button>
+          <span id="envSaveMsg" class="muted" role="status" aria-live="polite"></span>
+        </div>
+      </section>
+      {% endif %}
+    </section>
+
+    <div id="openingModal" class="modal" aria-hidden="true" role="dialog" aria-modal="true" aria-labelledby="openingTitle">
+      <div class="modal__dialog">
+        <h2 id="openingTitle">One-shot opening</h2>
+        <p class="muted">This line will be used for the next scheduled or manual text only.</p>
+        <textarea id="openingInput" maxlength="500" placeholder="Enter a short, professional opening..."></textarea>
+        <div class="modal__actions">
+          <button id="btnOpeningSave" class="btn btn-primary">Save</button>
+          <button id="btnOpeningCancel" class="btn">Cancel</button>
+        </div>
+        <div id="openingError" class="error" role="alert"></div>
+      </div>
+    </div>
+  </main>
+
+  <script src="/static/js/matrix-rain-blue.js"></script>
+  <script src="/static/scamtexts.js"></script>
+  <script src="/static/js/theme-enhance.js"></script>
+</body>
+</html>

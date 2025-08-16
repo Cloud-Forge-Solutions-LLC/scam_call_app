@@ -1,0 +1,48 @@
+/* Overrides for Scam Text Console */
+:root {
+  --accent: #72b8ff;
+  --accent-strong: #2a74c7;
+  --accent-soft: #9ad3ff;
+}
+
+.app-title .brand-mark {
+  color: var(--accent);
+}
+
+.kvgrid {
+  display: grid;
+  grid-template-columns: 1fr 2fr;
+  gap: 0.35rem 0.75rem;
+}
+.kvgrid .k { color: var(--muted, #a7b0b5); }
+.kvgrid .v { color: var(--fg, #e7ecef); }
+
+.stats-panel {
+  border: 1px solid rgba(255,255,255,0.06);
+  border-radius: 10px;
+  padding: 0.6rem 0.8rem;
+  background: rgba(0,0,0,0.25);
+}
+.stats-title { font-weight: 600; margin-bottom: 0.4rem; color: var(--accent); }
+.stats-row { display: flex; justify-content: space-between; padding: 0.15rem 0; }
+.stats-label { color: var(--muted, #a7b0b5); }
+.stats-value { font-variant-numeric: tabular-nums; }
+
+.modal__dialog textarea {
+  width: min(720px, 90vw);
+  height: 140px;
+  background: rgba(0,0,0,0.4);
+  border: 1px solid rgba(255,255,255,0.12);
+  color: #e8eef2;
+  padding: 0.6rem;
+  border-radius: 8px;
+}
+
+.error { color: #ffb4b4; margin-top: 0.4rem; }
+
+/* Blue-tinted vignette for SMS pages (overrides matrix.css background glow) */
+#matrix-canvas {
+  background:
+    radial-gradient(1200px 800px at 10% 10%, rgba(30, 70, 140, 0.12), rgba(0, 0, 0, 0)) fixed,
+    radial-gradient(1200px 800px at 90% 90%, rgba(30, 70, 140, 0.12), rgba(0, 0, 0, 0)) fixed;
+}

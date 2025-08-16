@@ -16,6 +16,7 @@
       <h1 class="app-title"><span class="brand-mark">SC</span> Scam Call Console</h1>
       <nav class="header-actions" aria-label="Primary actions">
         <a class="btn btn-secondary" href="/scamcalls/history" title="View call history">History</a>
+        <a class="btn btn-secondary" href="/scamtexts" title="Switch to texts">Texts</a>
         {% if is_admin %}
           <a class="btn btn-secondary" href="/admin/logout" id="btnLogout" title="Log out">Logout</a>
         {% else %}
@@ -37,6 +38,7 @@
       <!-- Metrics: total calls, total call time -->
       <div id="metricsArea" style="margin-top:0.8rem;"></div>
 
+      <!-- Dynamic scheduler/status details -->
       <div id="statusArea" class="status-area" aria-live="polite" aria-atomic="true"></div>
 
       {% if is_admin %}
@@ -48,19 +50,31 @@
             Update non-secret configuration values. Values are loaded from the server and persisted back to .env.
           </p>
         </div>
-        <!-- envEditor is rendered by JS as a responsive table on desktop and stacked cards on mobile -->
-        <div id="envEditor" class="env-editor" data-endpoint-get="/api/admin/env" data-endpoint-post="/api/admin/env" aria-busy="true" aria-live="polite">
-          <div class="skeleton-row" aria-hidden="true"></div>
-          <div class="skeleton-row" aria-hidden="true"></div>
-          <div class="skeleton-row" aria-hidden="true"></div>
-        </div>
-        <div class="form-actions">
+
+        <!-- Save at top to avoid scrolling; keep feedback span visible nearby -->
+        <div class="form-actions" style="justify-content:flex-start; margin-bottom: 0.75rem;">
           <button id="btnSaveEnv" class="btn btn-primary" type="button" disabled>Save settings</button>
+          <span id="envSaveMsg" class="muted" role="status" aria-live="polite" style="margin-left:0.75rem;"></span>
+        </div>
+
+        <!-- envEditor is rendered by JS as a responsive table on desktop and stacked cards on mobile -->
+        <div
+          id="envEditor"
+          class="env-editor"
+          data-endpoint-get="/api/admin/env"
+          data-endpoint-post="/api/admin/env"
+          aria-busy="true"
+          aria-live="polite"
+        >
+          <div class="skeleton-row" aria-hidden="true"></div>
+          <div class="skeleton-row" aria-hidden="true"></div>
+          <div class="skeleton-row" aria-hidden="true"></div>
         </div>
       </section>
       {% endif %}
     </section>
 
+    <!-- One-time greeting modal (used by #btnAddGreeting) -->
     <div id="greetingModal" class="modal" aria-hidden="true" role="dialog" aria-modal="true" aria-labelledby="greetingModalTitle">
       <div class="modal__dialog" role="document">
         <div class="modal__header">
@@ -79,6 +93,7 @@
       </div>
     </div>
 
+    <!-- Toast notifications -->
     <div id="toast" class="toast" role="status" aria-live="polite" aria-atomic="true"></div>
   </main>
 

@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Text History</title>
+  <link rel="icon" href="/static/favicon.svg" />
+  <link rel="stylesheet" href="/static/scamcalls.css" />
+  <link rel="stylesheet" href="/static/css/matrix.css" />
+  <link rel="stylesheet" href="/static/scamtexts.css" />
+</head>
+<body class="matrix-bg">
+  <canvas id="matrix-canvas" aria-hidden="true"></canvas>
+
+  <main class="page-container">
+    <header class="page-header">
+      <h1 class="app-title"><span class="brand-mark">SC</span> Text History</h1>
+      <nav class="header-actions" aria-label="Primary actions">
+        <a class="btn btn-secondary" href="/scamtexts" title="Live console">Live</a>
+        <a class="btn btn-secondary" href="/scamcalls" title="Switch to calls">Calls</a>
+      </nav>
+    </header>
+
+    <div class="content-grid">
+      <section class="card list-panel" role="region" aria-labelledby="list-title">
+        <h2 id="list-title" class="visually-hidden">Messages</h2>
+
+        <div class="list-actions">
+          <a class="btn" href="/api/texts/export.csv">Download CSV</a>
+          <a class="btn" href="/api/texts/export.json" target="_blank" rel="noopener">View JSON</a>
+        </div>
+
+        <div class="table-wrapper">
+          <table class="table">
+            <thead>
+              <tr>
+                <th scope="col">SID</th>
+                <th scope="col">Created</th>
+                <th scope="col">To</th>
+                <th scope="col">From</th>
+                <th scope="col">Status</th>
+                <th scope="col">Preview</th>
+              </tr>
+            </thead>
+            <tbody id="msgsBody">
+              <tr><td colspan="6" class="muted-inline">Loading…</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="muted" style="margin-top:0.5rem;">Select a SID to view full details.</div>
+      </section>
+
+      <aside class="card details-panel" role="region" aria-labelledby="details-title">
+        <h2 id="details-title" class="visually-hidden">Details</h2>
+        <div id="details" class="details muted">Select a message.</div>
+      </aside>
+    </div>
+  </main>
+
+  <script>
+    (function () {
+      "use strict";
+
+      function fmtTs(ts) {
+        if (!ts && ts !== 0) return "";
+        try {
+          const d = new Date(ts * 1000);
+          return d.toLocaleString();
+        } catch {
+          return "";
+        }
+      }
+
+      async function loadList() {
+        const tb = document.getElementById("msgsBody");
+        tb.innerHTML = '<tr><td colspan="6" class="muted-inline">Loading…</td></tr>';
+        try {
+          const r = await fetch("/api/texts/history");
+          const data = await r.json();
+          const rows = Array.isArray(data.messages) ? data.messages : [];
+          if (!rows.length) {
+            tb.innerHTML = '<tr><td colspan="6" class="muted-inline">No messages.</td></tr>';
+            return;
+          }
+          tb.innerHTML = "";
+          for (const m of rows) {
+            const tr = document.createElement("tr");
+            tr.innerHTML = [
+              `<td><a href="#" data-sid="${m.sid}">${m.sid}</a></td>`,
+              `<td>${fmtTs(m.created_at)}</td>`,
+              `<td>${m.to || ""}</td>`,
+              `<td>${m.from || ""}</td>`,
+              `<td>${m.status || ""}</td>`,
+              `<td>${(m.body_preview || "").replace(/</g,"&lt;")}</td>`,
+            ].join("");
+            tr.querySelector("a")?.addEventListener("click", (ev) => {
+              ev.preventDefault();
+              showDetails(m.sid);
+            });
+            tb.appendChild(tr);
+          }
+        } catch {
+          tb.innerHTML = '<tr><td colspan="6" class="muted-inline">Failed to load.</td></tr>';
+        }
+      }
+
+      async function showDetails(sid) {
+        const box = document.getElementById("details");
+        box.textContent = "Loading…";
+        try {
+          const r = await fetch(`/api/texts/history/${encodeURIComponent(sid)}`);
+          if (!r.ok) {
+            box.textContent = "Not found.";
+            return;
+          }
+          const d = await r.json();
+          const meta = d.meta || {};
+          const events = Array.isArray(d.events) ? d.events : [];
+          const esc = (s) => (String(s || "")).replace(/</g, "&lt;");
+          const lines = [];
+          lines.push(`<div><strong>SID:</strong> ${esc(d.sid)}</div>`);
+          lines.push(`<div><strong>To:</strong> ${esc(meta.to_masked || meta.to || "")}</div>`);
+          lines.push(`<div><strong>From:</strong> ${esc(meta.from_masked || meta.from || "")}</div>`);
+          lines.push(`<div><strong>Status:</strong> ${esc(meta.status || "")}</div>`);
+          lines.push(`<div><strong>Created:</strong> ${meta.created_at ? new Date(meta.created_at * 1000).toLocaleString() : ""}</div>`);
+          lines.push(`<div><strong>Updated:</strong> ${meta.updated_at ? new Date(meta.updated_at * 1000).toLocaleString() : ""}</div>`);
+          if (meta.delivered_at) {
+            lines.push(`<div><strong>Delivered:</strong> ${new Date(meta.delivered_at * 1000).toLocaleString()}</div>`);
+          }
+          lines.push(`<div class="divider"></div>`);
+          lines.push(`<div><strong>Body</strong></div>`);
+          lines.push(`<pre class="monotext">${esc((meta.body || ""))}</pre>`);
+          if (events.length) {
+            lines.push(`<div class="divider"></div>`);
+            lines.push(`<div><strong>Events</strong></div>`);
+            lines.push(`<ul>${events.map(ev => `<li>${new Date((ev.t||0)*1000).toLocaleString()} — ${esc(ev.event||"")} ${ev.status?("("+esc(ev.status)+")"):""}</li>`).join("")}</ul>`);
+          }
+          box.innerHTML = lines.join("");
+        } catch {
+          box.textContent = "Failed to load details.";
+        }
+      }
+
+      document.addEventListener("DOMContentLoaded", () => {
+        loadList();
+      });
+    })();
+  </script>
+  <script src="/static/js/matrix-rain-blue.js"></script>
+</body>
+</html>
