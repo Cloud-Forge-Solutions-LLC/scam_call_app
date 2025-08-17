@@ -5,10 +5,12 @@
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>Scam Text Console</title>
   <link rel="icon" href="/static/favicon.svg" />
-  <!-- Keep shared styles for consistency across pages -->
+  <!-- Shared styles for consistency across pages -->
   <link rel="stylesheet" href="/static/scamcalls.css" />
   <link rel="stylesheet" href="/static/css/matrix.css" />
   <link rel="stylesheet" href="/static/scamtexts.css" />
+  <!-- SMS Consent modal stylesheet -->
+  <link rel="stylesheet" href="{{ url_for('static', filename='sms_consent_modal.css') }}">
 </head>
 <body class="matrix-bg" data-is-admin="{{ '1' if is_admin else '0' }}">
   <canvas id="matrix-canvas" aria-hidden="true"></canvas>
@@ -18,7 +20,6 @@
       <h1 class="app-title"><span class="brand-mark">SC</span> Scam Text Console</h1>
       <nav class="header-actions" aria-label="Primary actions">
         <a class="btn btn-secondary" href="/scamtexts/history" title="View text history">History</a>
-        <!-- Consolidated to a single Calls link to avoid duplicates -->
         <a class="btn btn-secondary" href="/scamcalls" title="Switch to calls">Calls</a>
         {% if is_admin %}
           <a class="btn btn-secondary" href="/admin/logout" id="btnLogout" title="Log out">Logout</a>
@@ -30,11 +31,8 @@
 
     <section class="card" role="region" aria-labelledby="console-controls">
       <div class="controls-row" id="console-controls">
-        <!-- Text flow primary actions -->
         <button id="btnSendNow" class="btn btn-primary" type="button" aria-label="Send now">Send now</button>
         <button id="btnAddOpening" class="btn" type="button" aria-label="Add opening phrase">Add opening phrase</button>
-
-        <!-- Conversation engine controls for texts -->
         <div style="margin-left:auto; display:flex; align-items:center; gap:1rem;">
           <label style="display:flex; align-items:center; gap:0.4rem;">
             <input id="useEngineTexts" type="checkbox" />
@@ -50,7 +48,6 @@
       <div id="metricsArea" style="margin-top:0.8rem;"></div>
       <div id="statusArea" class="status-area" aria-live="polite" aria-atomic="true"></div>
 
-      <!-- Informational guidance from the other template variant -->
       <div class="muted" style="margin-top:0.8rem;">
         Configure whether inbound texts receive automated replies from the conversation engine (when available in your SMS webhook),
         or use your custom messages. This page adds settings only; wire your SMS webhook to apply them.
@@ -65,7 +62,6 @@
             Update non-secret configuration values. Values are loaded from the server and persisted back to .env.
           </p>
         </div>
-        <!-- Keep a simple editor container; the page script will handle rendering if used -->
         <div id="envEditor"></div>
         <div class="admin-panel__actions">
           <button id="btnSaveEnv" class="btn btn-primary">Save settings</button>
@@ -75,7 +71,6 @@
       {% endif %}
     </section>
 
-    <!-- One-shot opening modal -->
     <div id="openingModal" class="modal" aria-hidden="true" role="dialog" aria-modal="true" aria-labelledby="openingTitle">
       <div class="modal__dialog">
         <h2 id="openingTitle">One-shot opening</h2>
@@ -90,12 +85,12 @@
     </div>
   </main>
 
-  <!-- Scripts from both variants (order chosen to minimize conflicts) -->
+  <!-- Scripts for matrix background, scam texts UI, and theme enhancement -->
   <script src="/static/js/matrix-rain-blue.js"></script>
   <script src="/static/scamtexts.js"></script>
   <script src="/static/js/theme-enhance.js"></script>
 
-  <!-- Conversation engine settings script from the other variant -->
+  <!-- Conversation engine settings script -->
   <script>
     (function () {
       "use strict";
@@ -141,5 +136,8 @@
       loadSettings();
     })();
   </script>
+
+  <!-- SMS Consent modal script -->
+  <script defer src="{{ url_for('static', filename='sms_consent_modal.js') }}"></script>
 </body>
 </html>

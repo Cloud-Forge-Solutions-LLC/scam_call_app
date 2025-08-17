@@ -2,6 +2,7 @@
    - Injects a "SMS consent info" button next to #btnSendNow
    - Opens a <dialog> explaining consent and provides a copyable message
    - Pulls the configured SMS From number from /api/texts/status
+   - Additionally: shows the dialog automatically on the user's first visit to /scamtexts (per browser), while preserving all existing functionality.
 */
 
 (function () {
@@ -209,5 +210,18 @@
     const dlg = createDialog();
     wireDialog(dlg);
     injectButton(dlg);
+
+    // Show once automatically on first visit to /scamtexts (per browser).
+    // Uses a path-scoped key to avoid affecting other routes.
+    try {
+      const firstVisitKey = "smsc_first_visit_shown:/scamtexts";
+      if (!window.localStorage.getItem(firstVisitKey)) {
+        void openDialog(dlg);
+        window.localStorage.setItem(firstVisitKey, "1");
+      }
+    } catch (e) {
+      // If localStorage is unavailable, attempt to show the dialog once.
+      void openDialog(dlg);
+    }
   });
 })();
