@@ -1,0 +1,25 @@
+{
+  "sid": "SM74fb98be7888f167b239ffbf7802f39a",
+  "meta": {
+    "to": "+12092211140",
+    "from": "+19162487450",
+    "body": "Are you selling any anal engines?",
+    "status": "undelivered",
+    "error": "",
+    "created_at": 1755401502,
+    "updated_at": 1755401504,
+    "delivered_at": null
+  },
+  "events": [
+    {
+      "t": 1755401502,
+      "event": "created",
+      "status": "queued"
+    },
+    {
+      "t": 1755401504,
+      "event": "status",
+      "status": "undelivered"
+    }
+  ]
+}

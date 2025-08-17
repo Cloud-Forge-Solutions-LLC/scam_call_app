@@ -75,6 +75,186 @@
     }
   }
 
+  // ---------------------------------------
+  // Admin UI helpers for days/hours controls
+  // ---------------------------------------
+
+  // Inject minimal styles for the specialized controls (once)
+  (function ensureEnvControlsStyle() {
+    const id = "env-controls-style";
+    if (qs(`#${id}`)) return;
+    const style = document.createElement("style");
+    style.id = id;
+    style.textContent = `
+      .days-toggle {
+        display: flex;
+        gap: .4rem;
+        flex-wrap: wrap;
+        align-items: center;
+      }
+      .days-toggle button {
+        border: 1px solid var(--border, rgba(255,255,255,0.1));
+        background: rgba(255,255,255,0.04);
+        color: var(--text, #f3f5f7);
+        border-radius: 8px;
+        padding: .35rem .55rem;
+        min-width: 2.6rem;
+        font: inherit;
+        cursor: pointer;
+        transition: background-color .2s ease, border-color .2s ease, box-shadow .2s ease;
+      }
+      .days-toggle button.active, .days-toggle button[aria-pressed="true"] {
+        background: rgba(37, 194, 160, 0.16);
+        border-color: rgba(37, 194, 160, 0.35);
+        box-shadow: inset 0 0 0 1px rgba(37, 194, 160, 0.18);
+      }
+      .hours-range {
+        display: flex;
+        align-items: center;
+        gap: .5rem;
+        flex-wrap: wrap;
+      }
+      .hours-range input[type="time"] {
+        appearance: none;
+        -webkit-appearance: none;
+        border: 1px solid var(--border, rgba(255,255,255,0.1));
+        background: rgba(255,255,255,0.04);
+        color: var(--text, #f3f5f7);
+        border-radius: 8px;
+        padding: .35rem .5rem;
+        font: inherit;
+      }
+      .env-hint {
+        font-size: .9rem;
+        color: var(--muted, #aab2bd);
+        margin-top: .4rem;
+      }
+    `;
+    document.head.appendChild(style);
+  })();
+
+  const DAY_ORDER = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+
+  function normalizeDayAbbrev(s) {
+    const t = String(s || "").trim().slice(0, 3).toLowerCase();
+    const map = {
+      mon: "Mon", tue: "Tue", wed: "Wed", thu: "Thu", thur: "Thu", fri: "Fri", sat: "Sat", sun: "Sun"
+    };
+    return map[t] || "";
+  }
+
+  function parseDayCsv(s) {
+    if (!s) return [];
+    const raw = String(s).split(",").map((p) => normalizeDayAbbrev(p)).filter(Boolean);
+    // Deduplicate while preserving DAY_ORDER
+    const set = new Set(raw);
+    return DAY_ORDER.filter((d) => set.has(d));
+  }
+
+  function createActiveDaysControl(key, valueCsv) {
+    const selected = new Set(parseDayCsv(valueCsv).length ? parseDayCsv(valueCsv) : DAY_ORDER); // default to all days if empty
+    const wrap = document.createElement("div");
+    wrap.className = "days-toggle";
+    wrap.setAttribute("role", "group");
+    wrap.setAttribute("aria-label", "Active days");
+
+    DAY_ORDER.forEach((d) => {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.textContent = d;
+      const on = selected.has(d);
+      btn.className = on ? "active" : "";
+      btn.setAttribute("aria-pressed", on ? "true" : "false");
+      btn.dataset.day = d;
+      btn.addEventListener("click", () => {
+        const pressed = btn.getAttribute("aria-pressed") === "true";
+        const next = !pressed;
+        btn.setAttribute("aria-pressed", next ? "true" : "false");
+        btn.classList.toggle("active", next);
+        if (next) selected.add(d);
+        else selected.delete(d);
+        // Update hidden input in canonical order
+        hidden.value = Array.from(DAY_ORDER.filter((x) => selected.has(x))).join(",");
+      });
+      wrap.appendChild(btn);
+    });
+
+    const hidden = document.createElement("input");
+    hidden.type = "hidden";
+    hidden.className = "env-input";
+    hidden.dataset.key = key;
+    hidden.autocomplete = "off";
+    hidden.value = Array.from(DAY_ORDER.filter((x) => selected.has(x))).join(",");
+
+    return { container: wrap, hidden };
+  }
+
+  function parseHoursRange(s) {
+    const def = { start: "09:00", end: "18:00" };
+    const str = String(s || "").trim();
+    const m = str.match(/^(\d{2}):(\d{2})\s*-\s*(\d{2}):(\d{2})$/);
+    if (!m) return def;
+    const [ , sh, sm, eh, em ] = m;
+    const valid = (h, mi) => {
+      const H = Number(h), M = Number(mi);
+      return Number.isFinite(H) && Number.isFinite(M) && H >= 0 && H <= 23 && M >= 0 && M <= 59;
+    };
+    if (!valid(sh, sm) || !valid(eh, em)) return def;
+    return { start: `${sh}:${sm}`, end: `${eh}:${em}` };
+  }
+
+  function createHoursRangeControl(key, valueRange) {
+    const { start, end } = parseHoursRange(valueRange);
+    const wrap = document.createElement("div");
+    wrap.className = "hours-range";
+    wrap.setAttribute("role", "group");
+    wrap.setAttribute("aria-label", "Active hours (local)");
+
+    const startInput = document.createElement("input");
+    startInput.type = "time";
+    startInput.step = "60";
+    startInput.value = start;
+
+    const sep = document.createElement("span");
+    sep.textContent = "to";
+
+    const endInput = document.createElement("input");
+    endInput.type = "time";
+    endInput.step = "60";
+    endInput.value = end;
+
+    const hint = document.createElement("div");
+    hint.className = "env-hint";
+    hint.textContent = "24-hour format. Overnight ranges (e.g., 23:00–02:00) are allowed.";
+
+    function updateHidden() {
+      const s = (startInput.value || "09:00").padStart(5, "0");
+      const e = (endInput.value || "18:00").padStart(5, "0");
+      hidden.value = `${s}-${e}`;
+    }
+
+    startInput.addEventListener("change", updateHidden);
+    endInput.addEventListener("change", updateHidden);
+    startInput.addEventListener("input", updateHidden);
+    endInput.addEventListener("input", updateHidden);
+
+    wrap.appendChild(startInput);
+    wrap.appendChild(sep);
+    wrap.appendChild(endInput);
+
+    const hidden = document.createElement("input");
+    hidden.type = "hidden";
+    hidden.className = "env-input";
+    hidden.dataset.key = key;
+    hidden.autocomplete = "off";
+    hidden.value = `${(start || "09:00")}-${(end || "18:00")}`;
+
+    // Initial sync to ensure formatting is consistent
+    updateHidden();
+
+    return { container: wrap, hidden, hint };
+  }
+
   // -----------------------
   // Greeting modal logic
   // -----------------------
@@ -225,57 +405,82 @@
     items.forEach((row) => {
       const tr = document.createElement("tr");
 
-      // Key cell: show the key label (on mobile it appears above the input)
+      // Key cell
       const tdKey = document.createElement("td");
       const keyLabel = document.createElement("div");
       keyLabel.className = "env-key";
       keyLabel.textContent = row.key;
       tdKey.appendChild(keyLabel);
 
-      // Value cell: input/select/textarea
+      // Value cell
       const tdVal = document.createElement("td");
       const valWrapper = document.createElement("div");
       valWrapper.className = "env-value";
 
       let input;
-      if (row.key.endsWith("_DAYS")) {
-        input = document.createElement("input");
-        input.type = "text";
-        input.placeholder = "Mon,Tue,Wed,Thu,Fri";
-        input.value = row.value ?? "";
-      } else if (row.key.endsWith("_HOURS_LOCAL")) {
-        input = document.createElement("input");
-        input.type = "text";
-        input.placeholder = "09:00-18:00";
-        input.value = row.value ?? "";
-      } else if (row.key.endsWith("_SECONDS") || row.key.endsWith("_ATTEMPTS") || row.key.endsWith("_PORT")) {
-        input = document.createElement("input");
-        input.type = "number";
-        input.step = "1";
-        input.min = "0";
-        input.value = String(row.value ?? "");
-      } else if (["ROTATE_PROMPTS", "USE_NGROK", "NONINTERACTIVE", "LOG_COLOR", "ENABLE_MEDIA_STREAMS"].includes(row.key)) {
-        input = document.createElement("select");
-        ["true", "false"].forEach((v) => {
-          const opt = document.createElement("option");
-          opt.value = v;
-          opt.textContent = v;
-          if ((row.value ?? "").toString().toLowerCase() === v) opt.selected = true;
-          input.appendChild(opt);
-        });
+
+      if (row.key === "ACTIVE_DAYS") {
+        // Specialized day toggles + hidden env-input
+        const { container: daysCtrl, hidden } = createActiveDaysControl(row.key, row.value ?? "");
+        valWrapper.appendChild(daysCtrl);
+        input = hidden; // also append hidden input so save logic picks it up
+        valWrapper.appendChild(input);
+
+        const hint = document.createElement("div");
+        hint.className = "env-hint";
+        hint.textContent = "Click to include that day. Saved as Mon,Tue,Wed,Thu,Fri,Sat,Sun.";
+        valWrapper.appendChild(hint);
+
+      } else if (row.key === "ACTIVE_HOURS_LOCAL") {
+        // Specialized time range + hidden env-input
+        const { container: hoursCtrl, hidden, hint } = createHoursRangeControl(row.key, row.value ?? "");
+        valWrapper.appendChild(hoursCtrl);
+        input = hidden;
+        valWrapper.appendChild(input);
+        if (hint) valWrapper.appendChild(hint);
+
       } else {
-        input = document.createElement("input");
-        input.type = "text";
-        input.value = row.value ?? "";
+        // Default inputs for other keys
+        if (row.key.endsWith("_DAYS")) {
+          input = document.createElement("input");
+          input.type = "text";
+          input.placeholder = "Mon,Tue,Wed,Thu,Fri";
+          input.value = row.value ?? "";
+        } else if (row.key.endsWith("_HOURS_LOCAL")) {
+          input = document.createElement("input");
+          input.type = "text";
+          input.placeholder = "09:00-18:00";
+          input.value = row.value ?? "";
+        } else if (row.key.endsWith("_SECONDS") || row.key.endsWith("_ATTEMPTS") || row.key.endsWith("_PORT")) {
+          input = document.createElement("input");
+          input.type = "number";
+          input.step = "1";
+          input.min = "0";
+          input.value = String(row.value ?? "");
+        } else if (["ROTATE_PROMPTS", "USE_NGROK", "NONINTERACTIVE", "LOG_COLOR", "ENABLE_MEDIA_STREAMS"].includes(row.key)) {
+          input = document.createElement("select");
+          ["true", "false"].forEach((v) => {
+            const opt = document.createElement("option");
+            opt.value = v;
+            opt.textContent = v;
+            if ((row.value ?? "").toString().toLowerCase() === v) opt.selected = true;
+            input.appendChild(opt);
+          });
+        } else {
+          input = document.createElement("input");
+          input.type = "text";
+          input.value = row.value ?? "";
+        }
+        input.dataset.key = row.key;
+        input.autocomplete = "off";
+        input.className = "env-input";
+
+        // For small screens, preserve visible label near input as well (aria)
+        input.setAttribute("aria-label", row.key);
+
+        valWrapper.appendChild(input);
       }
-      input.dataset.key = row.key;
-      input.autocomplete = "off";
-      input.className = "env-input";
 
-      // For small screens, preserve visible label near input as well (aria)
-      input.setAttribute("aria-label", row.key);
-
-      valWrapper.appendChild(input);
       tdVal.appendChild(valWrapper);
 
       // Attach both cells to the row
@@ -296,6 +501,7 @@
     if (!container) return;
     const endpoint = container.getAttribute("data-endpoint-post") || "/api/admin/env";
 
+    // Collect all env-inputs, including hidden ones created for specialized controls
     const inputs = qsa("input.env-input, select.env-input, textarea.env-input", container);
     const updates = {};
     inputs.forEach((el) => {
@@ -592,13 +798,15 @@
   function appendTranscriptEntry(container, entry) {
     const role = entry.role || "Speaker";
     const text = entry.text || "";
-    const line = document.createElement("div");
-    line.className = "conv-line";
-    line.setAttribute("data-role", role);
-    line.setAttribute("data-final", entry.final ? "1" : "0");
-    line.innerHTML = `<span class="conv-role ${role === "Assistant" ? "assistant" : "callee"}">${escapeHtml(role)}:</span> <span class="conv-text">${escapeHtml(text)}</span>`;
-    container.appendChild(line);
-    container.scrollTop = container.scrollHeight;
+    either: {
+      const line = document.createElement("div");
+      line.className = "conv-line";
+      line.setAttribute("data-role", role);
+      line.setAttribute("data-final", entry.final ? "1" : "0");
+      line.innerHTML = `<span class="conv-role ${role === "Assistant" ? "assistant" : "callee"}">${escapeHtml(role)}:</span> <span class="conv-text">${escapeHtml(text)}</span>`;
+      container.appendChild(line);
+      container.scrollTop = container.scrollHeight;
+    }
   }
 
   // Merge logic: render finals and keep only one updating partial callee line

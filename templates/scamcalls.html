@@ -16,6 +16,7 @@
       <h1 class="app-title"><span class="brand-mark">SC</span> Scam Call Console</h1>
       <nav class="header-actions" aria-label="Primary actions">
         <a class="btn btn-secondary" href="/scamcalls/history" title="View call history">History</a>
+        <!-- Add switch to texts link from the other template -->
         <a class="btn btn-secondary" href="/scamtexts" title="Switch to texts">Texts</a>
         {% if is_admin %}
           <a class="btn btn-secondary" href="/admin/logout" id="btnLogout" title="Log out">Logout</a>
@@ -33,6 +34,18 @@
         <!-- Links to related pages (speech settings, caller messages) -->
         <a class="btn btn-secondary" href="/scamcalls/speech" id="btnSpeechSettings" role="button" aria-label="Speech settings">Speech settings</a>
         <a class="btn btn-secondary" href="/scamcalls/messages" id="btnMessages" role="button" aria-label="Caller messages">Caller messages</a>
+
+        <!-- Conversation engine controls -->
+        <div style="margin-left:auto; display:flex; align-items:center; gap:1rem;">
+          <label style="display:flex; align-items:center; gap:0.4rem;">
+            <input id="useEngineCalls" type="checkbox" />
+            <span>Use conversation engine</span>
+          </label>
+          <div>
+            <label for="attitudeCalls">Attitude: <span id="attitudeCallsVal">2</span></label>
+            <input id="attitudeCalls" type="range" min="1" max="5" step="1" value="2" style="vertical-align:middle; width:140px;" />
+          </div>
+        </div>
       </div>
 
       <!-- Metrics: total calls, total call time -->
@@ -57,7 +70,7 @@
           <span id="envSaveMsg" class="muted" role="status" aria-live="polite" style="margin-left:0.75rem;"></span>
         </div>
 
-        <!-- envEditor is rendered by JS as a responsive table on desktop and stacked cards on mobile -->
+        <!-- envEditor rendered by JS as a responsive table on desktop and stacked cards on mobile -->
         <div
           id="envEditor"
           class="env-editor"
@@ -100,5 +113,52 @@
   <script src="/static/js/matrix-rain.js"></script>
   <script src="/static/scamcalls.js"></script>
   <script src="/static/js/theme-enhance.js"></script>
+
+  <!-- Conversation engine settings script -->
+  <script>
+    (function () {
+      "use strict";
+      const useEngine = document.getElementById("useEngineCalls");
+      const att = document.getElementById("attitudeCalls");
+      const attVal = document.getElementById("attitudeCallsVal");
+
+      function setAttLabel() { attVal.textContent = String(att.value); }
+
+      async function loadSettings() {
+        try {
+          const r = await fetch("/api/conversation/settings");
+          const d = await r.json();
+          const v = d.values || {};
+          useEngine.checked = !!v.use_engine_calls;
+          att.value = Math.max(1, Math.min(5, Number(v.attitude_level || 2)));
+          setAttLabel();
+        } catch (e) {
+          console.warn("Failed to load conversation settings.", e);
+        }
+      }
+
+      async function save(partial) {
+        try {
+          await fetch("/api/conversation/settings", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(partial),
+          });
+        } catch (e) {
+          console.warn("Failed to save conversation settings.", e);
+        }
+      }
+
+      useEngine.addEventListener("change", () => {
+        save({ use_engine_calls: useEngine.checked });
+      });
+      att.addEventListener("input", setAttLabel);
+      att.addEventListener("change", () => {
+        save({ attitude_level: Number(att.value) });
+      });
+
+      loadSettings();
+    })();
+  </script>
 </body>
 </html>

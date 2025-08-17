@@ -1,0 +1,161 @@
+/* Minimal styling for the SMS consent dialog.
+   Designed to blend with a dark theme while remaining self-contained. */
+
+:root {
+  --smsc-bg: var(--surface-2, #111);
+  --smsc-fg: var(--text-1, #e6e6e6);
+  --smsc-muted: var(--text-2, #a0a0a0);
+  --smsc-accent: var(--accent, #2997ff);
+  --smsc-border: rgba(255, 255, 255, 0.08);
+  --smsc-shadow: 0 12px 30px rgba(0, 0, 0, 0.45), 0 1px 0 rgba(255, 255, 255, 0.03) inset;
+  --smsc-radius: 10px;
+  --smsc-gap: 16px;
+  --smsc-font: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Arial, sans-serif;
+}
+
+#smsConsentDialog {
+  color: var(--smsc-fg);
+  background: var(--smsc-bg);
+  border: 1px solid var(--smsc-border);
+  border-radius: var(--smsc-radius);
+  width: min(800px, 92vw);
+  padding: 0;
+  box-shadow: var(--smsc-shadow);
+  font-family: var(--smsc-font);
+}
+
+#smsConsentDialog::backdrop {
+  background: rgba(0, 0, 0, 0.6);
+}
+
+.smsc-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--smsc-border);
+}
+
+.smsc-title {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.smsc-close {
+  border: 1px solid var(--smsc-border);
+  background: transparent;
+  color: var(--smsc-fg);
+  border-radius: 8px;
+  padding: 6px 10px;
+  cursor: pointer;
+}
+
+.smsc-close:hover {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.smsc-body {
+  padding: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: var(--smsc-gap);
+}
+
+.smsc-note {
+  color: var(--smsc-muted);
+  line-height: 1.5;
+}
+
+.smsc-steps {
+  padding-left: 18px;
+  line-height: 1.6;
+}
+
+.smsc-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.smsc-kbd {
+  display: inline-block;
+  border: 1px solid var(--smsc-border);
+  border-bottom-width: 2px;
+  border-radius: 6px;
+  padding: 1px 6px;
+  background: rgba(255, 255, 255, 0.03);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-size: 0.95em;
+}
+
+.smsc-box {
+  border: 1px solid var(--smsc-border);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.03);
+  padding: 12px;
+}
+
+.smsc-monotext {
+  width: 100%;
+  min-height: 84px;
+  max-height: 220px;
+  resize: vertical;
+  border: 1px solid var(--smsc-border);
+  background: rgba(0, 0, 0, 0.35);
+  color: var(--smsc-fg);
+  border-radius: 8px;
+  padding: 10px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+}
+
+.smsc-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.smsc-btn {
+  border: 1px solid var(--smsc-border);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--smsc-fg);
+  border-radius: 8px;
+  padding: 8px 12px;
+  cursor: pointer;
+}
+
+.smsc-btn:hover {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.smsc-btn.primary {
+  border-color: rgba(41, 151, 255, 0.35);
+  background: rgba(41, 151, 255, 0.15);
+  color: #d7eaff;
+}
+
+.smsc-footer {
+  padding: 12px 18px 16px 18px;
+  border-top: 1px solid var(--smsc-border);
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.smsc-link {
+  color: var(--smsc-accent);
+  text-decoration: none;
+}
+
+.smsc-link:hover {
+  text-decoration: underline;
+}
+
+.smsc-warn {
+  color: #ffdd99;
+}
+
+.smsc-small {
+  font-size: 0.92em;
+  color: var(--smsc-muted);
+}

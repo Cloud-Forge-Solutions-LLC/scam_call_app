@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>Scam Text Console</title>
   <link rel="icon" href="/static/favicon.svg" />
+  <!-- Keep shared styles for consistency across pages -->
   <link rel="stylesheet" href="/static/scamcalls.css" />
   <link rel="stylesheet" href="/static/css/matrix.css" />
   <link rel="stylesheet" href="/static/scamtexts.css" />
@@ -17,6 +18,7 @@
       <h1 class="app-title"><span class="brand-mark">SC</span> Scam Text Console</h1>
       <nav class="header-actions" aria-label="Primary actions">
         <a class="btn btn-secondary" href="/scamtexts/history" title="View text history">History</a>
+        <!-- Consolidated to a single Calls link to avoid duplicates -->
         <a class="btn btn-secondary" href="/scamcalls" title="Switch to calls">Calls</a>
         {% if is_admin %}
           <a class="btn btn-secondary" href="/admin/logout" id="btnLogout" title="Log out">Logout</a>
@@ -28,12 +30,31 @@
 
     <section class="card" role="region" aria-labelledby="console-controls">
       <div class="controls-row" id="console-controls">
+        <!-- Text flow primary actions -->
         <button id="btnSendNow" class="btn btn-primary" type="button" aria-label="Send now">Send now</button>
         <button id="btnAddOpening" class="btn" type="button" aria-label="Add opening phrase">Add opening phrase</button>
+
+        <!-- Conversation engine controls for texts -->
+        <div style="margin-left:auto; display:flex; align-items:center; gap:1rem;">
+          <label style="display:flex; align-items:center; gap:0.4rem;">
+            <input id="useEngineTexts" type="checkbox" />
+            <span>Use conversation engine</span>
+          </label>
+          <div>
+            <label for="attitudeTexts">Attitude: <span id="attitudeTextsVal">2</span></label>
+            <input id="attitudeTexts" type="range" min="1" max="5" step="1" value="2" style="vertical-align:middle; width:140px;" />
+          </div>
+        </div>
       </div>
 
       <div id="metricsArea" style="margin-top:0.8rem;"></div>
       <div id="statusArea" class="status-area" aria-live="polite" aria-atomic="true"></div>
+
+      <!-- Informational guidance from the other template variant -->
+      <div class="muted" style="margin-top:0.8rem;">
+        Configure whether inbound texts receive automated replies from the conversation engine (when available in your SMS webhook),
+        or use your custom messages. This page adds settings only; wire your SMS webhook to apply them.
+      </div>
 
       {% if is_admin %}
       <hr />
@@ -44,6 +65,7 @@
             Update non-secret configuration values. Values are loaded from the server and persisted back to .env.
           </p>
         </div>
+        <!-- Keep a simple editor container; the page script will handle rendering if used -->
         <div id="envEditor"></div>
         <div class="admin-panel__actions">
           <button id="btnSaveEnv" class="btn btn-primary">Save settings</button>
@@ -53,6 +75,7 @@
       {% endif %}
     </section>
 
+    <!-- One-shot opening modal -->
     <div id="openingModal" class="modal" aria-hidden="true" role="dialog" aria-modal="true" aria-labelledby="openingTitle">
       <div class="modal__dialog">
         <h2 id="openingTitle">One-shot opening</h2>
@@ -67,8 +90,56 @@
     </div>
   </main>
 
+  <!-- Scripts from both variants (order chosen to minimize conflicts) -->
   <script src="/static/js/matrix-rain-blue.js"></script>
   <script src="/static/scamtexts.js"></script>
   <script src="/static/js/theme-enhance.js"></script>
+
+  <!-- Conversation engine settings script from the other variant -->
+  <script>
+    (function () {
+      "use strict";
+      const useEngine = document.getElementById("useEngineTexts");
+      const att = document.getElementById("attitudeTexts");
+      const attVal = document.getElementById("attitudeTextsVal");
+
+      function setAttLabel() { attVal.textContent = String(att.value); }
+
+      async function loadSettings() {
+        try {
+          const r = await fetch("/api/conversation/settings");
+          const d = await r.json();
+          const v = d.values || {};
+          useEngine.checked = !!v.use_engine_texts;
+          att.value = Math.max(1, Math.min(5, Number(v.attitude_level || 2)));
+          setAttLabel();
+        } catch (e) {
+          console.warn("Failed to load conversation settings.", e);
+        }
+      }
+
+      async function save(partial) {
+        try {
+          await fetch("/api/conversation/settings", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(partial),
+          });
+        } catch (e) {
+          console.warn("Failed to save conversation settings.", e);
+        }
+      }
+
+      useEngine.addEventListener("change", () => {
+        save({ use_engine_texts: useEngine.checked });
+      });
+      att.addEventListener("input", setAttLabel);
+      att.addEventListener("change", () => {
+        save({ attitude_level: Number(att.value) });
+      });
+
+      loadSettings();
+    })();
+  </script>
 </body>
 </html>

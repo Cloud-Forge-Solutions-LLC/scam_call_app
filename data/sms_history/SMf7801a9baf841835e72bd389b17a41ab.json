@@ -1,0 +1,25 @@
+{
+  "sid": "SMf7801a9baf841835e72bd389b17a41ab",
+  "meta": {
+    "to": "+12092211140",
+    "from": "+14806396734",
+    "body": "I wish you never saw my butt",
+    "status": "undelivered",
+    "error": "",
+    "created_at": 1755401516,
+    "updated_at": 1755401517,
+    "delivered_at": null
+  },
+  "events": [
+    {
+      "t": 1755401516,
+      "event": "created",
+      "status": "queued"
+    },
+    {
+      "t": 1755401517,
+      "event": "status",
+      "status": "undelivered"
+    }
+  ]
+}

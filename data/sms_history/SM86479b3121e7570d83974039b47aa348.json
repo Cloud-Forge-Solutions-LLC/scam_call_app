@@ -1,0 +1,25 @@
+{
+  "sid": "SM86479b3121e7570d83974039b47aa348",
+  "meta": {
+    "to": "+12092211140",
+    "from": "+12093202395",
+    "body": "Can you help me find an engine to my car. I totaled it going to your moms house",
+    "status": "undelivered",
+    "error": "",
+    "created_at": 1755393368,
+    "updated_at": 1755393368,
+    "delivered_at": null
+  },
+  "events": [
+    {
+      "t": 1755393368,
+      "event": "created",
+      "status": "queued"
+    },
+    {
+      "t": 1755393368,
+      "event": "status",
+      "status": "undelivered"
+    }
+  ]
+}
