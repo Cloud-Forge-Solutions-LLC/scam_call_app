@@ -18,6 +18,7 @@ Notes:
 from __future__ import annotations
 
 import atexit
+import asyncio
 import base64
 import csv
 import json
@@ -251,6 +252,8 @@ class RuntimeConfig:
     public_base_url: Optional[str] = None
     use_ngrok: bool = False
     enable_media_streams: bool = False
+    stream_outbound_audio: bool = False  # New: whether to stream outbound audio to caller
+    use_hypercorn: bool = False  # New: whether to use Hypercorn ASGI server for WebSocket support
 
     flask_host: str = "0.0.0.0"
     flask_port: int = 8080
@@ -337,6 +340,8 @@ def _load_runtime_from_env() -> None:
     _runtime.public_base_url = (os.environ.get("PUBLIC_BASE_URL") or "").strip() or None
     _runtime.use_ngrok = _parse_bool(os.environ.get("USE_NGROK"), False)
     _runtime.enable_media_streams = _parse_bool(os.environ.get("ENABLE_MEDIA_STREAMS"), False)
+    _runtime.stream_outbound_audio = _parse_bool(os.environ.get("STREAM_OUTBOUND_AUDIO"), False)
+    _runtime.use_hypercorn = _parse_bool(os.environ.get("USE_HYPERCORN"), False)
 
     _runtime.flask_host = (os.environ.get("FLASK_HOST") or "0.0.0.0").strip() or "0.0.0.0"
     _runtime.flask_port = _parse_int(os.environ.get("FLASK_PORT"), 8080)
@@ -376,6 +381,8 @@ _EDITABLE_ENV_KEYS = [
     "CALLEE_SILENCE_HANGUP_SECONDS",
     "USE_NGROK",
     "ENABLE_MEDIA_STREAMS",
+    "STREAM_OUTBOUND_AUDIO",  # New: toggle outbound media streaming
+    "USE_HYPERCORN",          # New: toggle Hypercorn server
     "NONINTERACTIVE",
     "LOG_COLOR",
     "FLASK_HOST",
@@ -477,6 +484,37 @@ def _apply_env_updates(updates: Dict[str, str]) -> None:
             os.environ[k] = "" if v is None else str(v)
     _load_runtime_from_env()
     _log_runtime_summary(context="after env update")
+
+
+def _reload_runtime_after_env_update() -> None:
+    """
+    Reload critical runtime settings that may have changed via admin panel,
+    logging any changes for easier debugging. This lets you toggle media streams
+    and other key settings without a full server restart (pretty handy!).
+    """
+    # Store previous values for comparison
+    prev_enable_media = _runtime.enable_media_streams
+    prev_stream_outbound = _runtime.stream_outbound_audio
+    prev_public_url = _runtime.public_base_url
+    
+    # Re-read the specific flags we care about
+    _runtime.enable_media_streams = _parse_bool(os.environ.get("ENABLE_MEDIA_STREAMS"), False)
+    _runtime.stream_outbound_audio = _parse_bool(os.environ.get("STREAM_OUTBOUND_AUDIO"), False)
+    _runtime.public_base_url = (os.environ.get("PUBLIC_BASE_URL") or "").strip() or None
+    
+    # Log what actually changed (helps with debugging)
+    changes = []
+    if prev_enable_media != _runtime.enable_media_streams:
+        changes.append(f"ENABLE_MEDIA_STREAMS: {prev_enable_media} -> {_runtime.enable_media_streams}")
+    if prev_stream_outbound != _runtime.stream_outbound_audio:
+        changes.append(f"STREAM_OUTBOUND_AUDIO: {prev_stream_outbound} -> {_runtime.stream_outbound_audio}")
+    if prev_public_url != _runtime.public_base_url:
+        changes.append(f"PUBLIC_BASE_URL: {prev_public_url or '(none)'} -> {_runtime.public_base_url or '(none)'}")
+    
+    if changes:
+        log.info("Runtime settings reloaded, changes: %s", "; ".join(changes))
+    else:
+        log.debug("Runtime settings reloaded, no changes detected")
 
 
 # Attempt pacing
@@ -1365,7 +1403,9 @@ def api_admin_env_post():
                 clean_updates[str(k)] = "" if v is None else str(v)
         log.info("POST /api/admin/env applying %s updates.", len(clean_updates))
         _apply_env_updates(clean_updates)
-        return jsonify({"ok": True})
+        # Reload runtime settings immediately so changes take effect right away
+        _reload_runtime_after_env_update()
+        return jsonify({"ok": True, "reloaded": True})
     except Exception as e:
         log.exception("Failed to save env updates: %s", e)
         return Response("Failed to save settings.", status=500)
@@ -1621,16 +1661,47 @@ def voice_entrypoint():
             started_at=int(time.time()),
         )
 
+    # ============================================================================
+    # Media Streams setup (for live audio listening feature)
+    # ============================================================================
     if _runtime.enable_media_streams and Start is not None and Stream is not None and _runtime.public_base_url:
         try:
             start = Start()
             ws_base = _runtime.public_base_url.replace("http:", "ws:").replace("https:", "wss:")
+            
+            # Always attach inbound stream (lets you hear the caller)
             start.stream(url=f"{ws_base}/media-in", track="inbound_track")
-            start.stream(url=f"{ws_base}/media-out", track="outbound_track")
+            inbound_attached = True
+            
+            # Only attach outbound stream if explicitly enabled (saves bandwidth)
+            outbound_attached = False
+            if _runtime.stream_outbound_audio:
+                start.stream(url=f"{ws_base}/media-out", track="outbound_track")
+                outbound_attached = True
+            
             vr.append(start)
-            log.info("Attached media streams to call.")
+            
+            # Safety logging to make debugging easier
+            log.info(
+                "Attached media streams inbound=%s outbound=%s (CallSid=%s)",
+                inbound_attached,
+                outbound_attached,
+                _mask_sid(call_sid)
+            )
         except Exception as e:
             log.warning("Failed to attach media streams: %s", e)
+    else:
+        # Log why media streams weren't attached (helps troubleshooting)
+        reasons = []
+        if not _runtime.enable_media_streams:
+            reasons.append("ENABLE_MEDIA_STREAMS=false")
+        if Start is None or Stream is None:
+            reasons.append("TwiML classes unavailable")
+        if not _runtime.public_base_url:
+            reasons.append("PUBLIC_BASE_URL not set")
+        
+        if reasons:
+            log.debug("Media streams not attached: %s (CallSid=%s)", ", ".join(reasons), _mask_sid(call_sid))
 
     g = Gather(
         input="speech",
@@ -2158,11 +2229,47 @@ def main():
     _log_runtime_summary(context="startup")
     _start_ngrok_if_enabled()
     _start_background_threads()
+    
     host = _runtime.flask_host or os.environ.get("FLASK_HOST", "0.0.0.0")
     port = int(_runtime.flask_port or _parse_int(os.environ.get("FLASK_PORT"), 8080))
     debug = bool(_runtime.flask_debug or _parse_bool(os.environ.get("FLASK_DEBUG"), False))
-    log.info("Starting Flask on %s:%s (debug=%s)", host, port, debug)
-    app.run(host=host, port=port, debug=debug, use_reloader=False)
+    
+    # ============================================================================
+    # Hypercorn ASGI server support (better for WebSocket media streams)
+    # ============================================================================
+    if _runtime.use_hypercorn:
+        try:
+            # Try to import and use Hypercorn for proper WebSocket support
+            from hypercorn.asyncio import serve  # type: ignore
+            from hypercorn.config import Config  # type: ignore
+            
+            config = Config()
+            config.bind = [f"{host}:{port}"]
+            # Keep reasonably short timeouts for responsiveness
+            config.keep_alive_timeout = 5
+            config.graceful_timeout = 10
+            
+            log.info("Starting Hypercorn ASGI server on %s:%s (WebSocket support enabled)", host, port)
+            log.info("Note: This enables proper 101 WebSocket upgrades needed for Twilio Media Streams")
+            
+            # Run the ASGI server
+            asyncio.run(serve(app, config))
+            
+        except ImportError:
+            log.warning("Hypercorn not available (pip3 install hypercorn), falling back to Flask dev server")
+            log.warning("WARNING: Flask dev server doesn't support WebSocket upgrades - media streams may not work!")
+            app.run(host=host, port=port, debug=debug, use_reloader=False)
+        except Exception as e:
+            log.error("Failed to start Hypercorn: %s", e)
+            log.warning("Falling back to Flask dev server (WebSocket upgrades may not work)")
+            app.run(host=host, port=port, debug=debug, use_reloader=False)
+    else:
+        # Standard Flask development server (fine for testing, but no WebSocket upgrades)
+        log.info("Starting Flask dev server on %s:%s (debug=%s)", host, port, debug)
+        if _runtime.enable_media_streams:
+            log.warning("Media streams enabled but using Flask dev server - WebSocket upgrades may fail!")
+            log.warning("Consider setting USE_HYPERCORN=true for proper WebSocket support")
+        app.run(host=host, port=port, debug=debug, use_reloader=False)
 
 
 if __name__ == "__main__":
