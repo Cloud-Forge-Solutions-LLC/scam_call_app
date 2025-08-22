@@ -77,6 +77,7 @@ from flask import (
     jsonify,
     make_response,
     redirect,
+    render_template,
     render_template_string,
     request,
     send_file,
@@ -679,8 +680,40 @@ def allowed_destination(to_number: str) -> bool:
     # Allow-list by country code prefix
     return any(to_number.startswith(cc) for cc in ALLOWED_COUNTRY_CODES)
 
+# Global rate limiting storage
+CALL_TIMESTAMPS = deque()
+RATE_LIMIT_LOCK = threading.Lock()
+
+def check_rate_limit() -> bool:
+    """Check if we're within rate limits. Returns True if OK to proceed."""
+    max_calls_per_hour = env_int("MAX_CALLS_PER_HOUR", 10)
+    call_window_minutes = env_int("CALL_WINDOW_MINUTES", 60)
+    
+    now = time.time()
+    window_start = now - (call_window_minutes * 60)
+    
+    with RATE_LIMIT_LOCK:
+        # Remove old timestamps outside the window
+        while CALL_TIMESTAMPS and CALL_TIMESTAMPS[0] < window_start:
+            CALL_TIMESTAMPS.popleft()
+        
+        # Check if we're at the limit
+        return len(CALL_TIMESTAMPS) < max_calls_per_hour
+
+def record_call_attempt():
+    """Record a call attempt for rate limiting"""
+    with RATE_LIMIT_LOCK:
+        CALL_TIMESTAMPS.append(time.time())
+
 @app.route("/api/scamcalls/call-now", methods=["POST"])
 def call_now():
+    # Check rate limit first
+    if not check_rate_limit():
+        return jsonify({"error": "cap"}), 429
+    
+    # Record the call attempt immediately after rate limit check passes
+    record_call_attempt()
+    
     if not twilio_client:
         return jsonify({"ok": False, "error": "Twilio not configured"}), 400
     to_number = env_str("TO_NUMBER") or TO_NUMBER
@@ -722,21 +755,39 @@ def call_now():
                 cs = CallState(call_sid=call.sid)
                 CALLS[call.sid] = cs
             cs.prompt_used = select_prompt()  # approximate the one that will be spoken
+        
         return jsonify({"ok": True, "sid": call.sid})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
 @app.route("/api/scamcalls/status", methods=["GET"])
 def scamcalls_status():
-    # Basic status for UI
+    # Basic status for UI - updated to match frontend expectations
+    with CALLS_LOCK:
+        # Check if there are any active calls
+        active_call = None
+        for sid, cs in CALLS.items():
+            if cs.status in ["initiated", "ringing", "answered", "in-progress"]:
+                active_call = cs
+                break
+    
+    # Get rate limiting info
+    max_calls_per_hour = env_int("MAX_CALLS_PER_HOUR", 10)
+    max_calls_per_day = env_int("MAX_CALLS_PER_DAY", 100)
+    
     data = {
-        "public_base_url": PUBLIC_BASE_URL,
-        "to_number_masked": mask_number(env_str("TO_NUMBER") or TO_NUMBER),
-        "from_numbers": [mask_number(n) for n in ([FROM_NUMBER] if FROM_NUMBER else []) + FROM_NUMBERS],
-        "recording_mode": RECORDING_MODE,
-        "rotate_prompts": ROTATE_PROMPTS,
-        "language": TTS_LANG,
-        "voice": TTS_VOICE,
+        "active": bool(active_call),
+        "callSid": active_call.call_sid if active_call else None,
+        "destNumber": mask_number(env_str("TO_NUMBER") or TO_NUMBER),
+        "fromNumber": mask_number(env_str("FROM_NUMBER") or FROM_NUMBER or (FROM_NUMBERS[0] if FROM_NUMBERS else "")),
+        "activeWindow": f"{env_str('ACTIVE_HOURS_LOCAL', '24/7')}",
+        "caps": {
+            "hourly": max_calls_per_hour,
+            "daily": max_calls_per_day
+        },
+        "publicUrl": PUBLIC_BASE_URL or "auto",
+        "nextCallEpochSec": None,  # TODO: implement countdown logic
+        "nextCallStartEpochSec": None  # TODO: implement countdown logic
     }
     return jsonify(data)
 
@@ -746,6 +797,25 @@ def mask_number(num: str) -> str:
     if len(num) <= 4:
         return "*" * len(num)
     return "*" * (len(num) - 4) + num[-4:]
+
+@app.route("/api/scamcalls/active", methods=["GET"])
+def scamcalls_active():
+    """Get details about the currently active call, if any"""
+    with CALLS_LOCK:
+        active_call = None
+        for sid, cs in CALLS.items():
+            if cs.status in ["initiated", "ringing", "answered", "in-progress"]:
+                active_call = cs
+                break
+        
+        if not active_call:
+            return jsonify({"callSid": None, "status": "idle", "transcript": []})
+        
+        return jsonify({
+            "callSid": active_call.call_sid,
+            "status": active_call.status,
+            "transcript": active_call.transcript
+        })
 
 @app.route("/api/scamcalls/next-opening", methods=["POST"])
 def next_opening():
@@ -762,6 +832,41 @@ def next_opening():
         with ONE_SHOT_OPENING_LOCK:
             global ONE_SHOT_OPENING
             ONE_SHOT_OPENING = safe
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+# Global variable for greeting phrase storage
+NEXT_GREETING_PHRASE = None
+NEXT_GREETING_LOCK = threading.Lock()
+
+@app.route("/api/scamcalls/next-greeting", methods=["POST"])
+def next_greeting():
+    """Set a greeting phrase for the next call"""
+    try:
+        payload = request.get_json(force=True, silent=True) or {}
+        phrase = (payload.get("phrase") or "").strip()
+        
+        if not phrase:
+            return jsonify({"ok": False, "error": "Empty phrase"}), 400
+        
+        # Validate 5-15 words
+        words = phrase.split()
+        if len(words) < 5:
+            return jsonify({"ok": False, "error": "Phrase must be at least 5 words"}), 400
+        if len(words) > 15:
+            return jsonify({"ok": False, "error": "Phrase must be at most 15 words"}), 400
+        
+        # Sanitize the phrase
+        safe, was_san = sanitize_line(phrase)
+        if not safe:
+            return jsonify({"ok": False, "error": "Phrase contained disallowed content"}), 400
+        
+        # Store for one-time use
+        with NEXT_GREETING_LOCK:
+            global NEXT_GREETING_PHRASE
+            NEXT_GREETING_PHRASE = safe
+        
         return jsonify({"ok": True})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 400
@@ -994,6 +1099,10 @@ SAFE_ENV_KEYS = {
     "TOPIC",
     "ALLOWED_COUNTRY_CODES",
     "CALLEE_SILENCE_HANGUP_SECONDS",
+    "MAX_CALLS_PER_HOUR",
+    "CALL_WINDOW_MINUTES",
+    "CALLEE_NUMBER",
+    "CALLER_ID",
 }
 
 @app.route("/admin", methods=["GET"])
@@ -1052,6 +1161,112 @@ def admin_restart():
     return jsonify({"ok": True})
 
 # -------------------------
+# Admin API endpoints for frontend integration
+# -------------------------
+
+@app.route("/api/admin/login", methods=["POST"])
+def api_admin_login():
+    """Admin login endpoint for AJAX"""
+    try:
+        data = request.get_json() or {}
+        username = data.get("username", "")
+        password = data.get("password", "")
+        
+        if not ADMIN_PASSWORD_HASH:
+            return jsonify({"ok": False, "error": "Admin is not configured."}), 400
+        elif username != ADMIN_USER:
+            return jsonify({"ok": False, "error": "Invalid credentials."}), 401
+        elif not bcrypt_check(password, ADMIN_PASSWORD_HASH):
+            return jsonify({"ok": False, "error": "Invalid credentials."}), 401
+        else:
+            session["is_admin"] = True
+            return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+@app.route("/api/admin/logout", methods=["POST"])
+def api_admin_logout():
+    """Admin logout endpoint for AJAX"""
+    session.clear()
+    return jsonify({"ok": True})
+
+@app.route("/api/admin/config", methods=["GET"])
+def api_admin_config():
+    """Get safe environment configuration"""
+    if not is_admin():
+        return jsonify({"ok": False, "error": "Not authenticated"}), 401
+    
+    config = {}
+    for k in SAFE_ENV_KEYS:
+        config[k] = os.getenv(k, "")
+    
+    return jsonify({"ok": True, "config": config})
+
+@app.route("/api/admin/config", methods=["PUT"])
+def api_admin_config_update():
+    """Update safe environment configuration"""
+    if not is_admin():
+        return jsonify({"ok": False, "error": "Not authenticated"}), 401
+    
+    try:
+        data = request.get_json() or {}
+        updates = data.get("updates", {})
+        
+        if not isinstance(updates, dict):
+            return jsonify({"ok": False, "error": "Invalid updates format"}), 400
+        
+        # Filter to only safe keys
+        safe_updates = {}
+        for k, v in updates.items():
+            if k in SAFE_ENV_KEYS:
+                safe_updates[k] = str(v).strip()
+        
+        if not safe_updates:
+            return jsonify({"ok": False, "error": "No valid keys to update"}), 400
+        
+        # Update environment variables in memory
+        for k, v in safe_updates.items():
+            os.environ[k] = v
+        
+        # Update .env file
+        env_path = Path(".env")
+        current_lines = []
+        if env_path.exists():
+            try:
+                with open(env_path, "r", encoding="utf-8") as f:
+                    current_lines = f.read().splitlines()
+            except Exception:
+                current_lines = []
+        
+        # Parse existing env into dict while preserving order
+        env_map = {}
+        comment_lines = []
+        for i, line in enumerate(current_lines):
+            if not line.strip() or line.strip().startswith("#"):
+                comment_lines.append((i, line))
+                continue
+            if "=" in line:
+                k, v = line.split("=", 1)
+                env_map[k.strip()] = v
+        
+        # Update with new values
+        for k, v in safe_updates.items():
+            env_map[k] = v
+        
+        # Recreate .env content (simplified version - may not preserve exact order)
+        content_lines = []
+        for k, v in env_map.items():
+            content_lines.append(f"{k}={v}")
+        
+        new_content = "\n".join(content_lines) + "\n"
+        atomic_write_env(new_content)
+        
+        return jsonify({"ok": True, "saved": list(safe_updates.keys())})
+    
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+# -------------------------
 # UI pages
 # -------------------------
 
@@ -1062,7 +1277,7 @@ def index():
 @app.route("/scamcalls")
 def scamcalls():
     token = issue_ws_token()
-    return render_template_string(TPL_SCAMCALLS, ws_token=token)
+    return render_template("scamcalls.html", ws_token=token)
 
 @app.route("/scamcalls/history")
 def scamcalls_history():
