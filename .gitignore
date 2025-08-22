@@ -3,3 +3,4 @@
 .env*
 scam_app.db
 *.db
+Added .env.test
