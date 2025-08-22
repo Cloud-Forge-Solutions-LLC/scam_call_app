@@ -45,7 +45,32 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from dotenv import load_dotenv
+# Add vendor directory to path for dependencies
+sys.path.insert(0, str(Path(__file__).parent / "vendor"))
+
+from database import (
+    init_database,
+    persist_call_history_csv,
+    load_history_rows_csv,
+)
+
+# Optional imports - make them optional for testing
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    load_dotenv = lambda: None
+
+try:
+    import bcrypt
+except ImportError:
+    bcrypt = None
+
+try:
+    from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
+except ImportError:
+    URLSafeTimedSerializer = BadSignature = SignatureExpired = None
+
+# Essential Flask imports from vendor
 from flask import (
     Flask,
     abort,
@@ -58,17 +83,25 @@ from flask import (
     session,
     url_for,
 )
-from flask_sock import Sock
-import bcrypt
-from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 
-# Twilio
-from twilio.twiml.voice_response import VoiceResponse, Gather, Start, Stream, Pause, Say
-from twilio.rest import Client as TwilioClient
+try:
+    from flask_sock import Sock
+except ImportError:
+    Sock = None
 
-# Hot-reload (watch this file)
-from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
+# Optional Twilio imports
+try:
+    from twilio.twiml.voice_response import VoiceResponse, Gather, Start, Stream, Pause, Say
+    from twilio.rest import Client as TwilioClient
+except ImportError:
+    VoiceResponse = Gather = Start = Stream = Pause = Say = TwilioClient = None
+
+# Optional watchdog imports
+try:
+    from watchdog.observers import Observer
+    from watchdog.events import FileSystemEventHandler
+except ImportError:
+    Observer = FileSystemEventHandler = None
 
 # -------------------------
 # ENVIRONMENT VARIABLES
@@ -427,53 +460,16 @@ def persist_call_history(call_sid: str) -> None:
         cs = CALLS.get(call_sid)
         if not cs:
             return
-        row = {
-            "callSid": cs.call_sid,
-            "startedAt": cs.started_at.isoformat(),
-            "durationSec": str(cs.duration_sec or 0),
-            "outcome": cs.outcome,
-            "transcript": json.dumps(cs.transcript, ensure_ascii=False),
-            "prompt": cs.prompt_used,
-        }
-    ensure_dir(HISTORY_CSV_PATH)
-    file_exists = HISTORY_CSV_PATH.exists()
-    headers = ["callSid", "startedAt", "durationSec", "outcome", "transcript", "prompt"]
-    # De-dup by CallSid if already present (load minimal to check)
-    existing_sids = set()
-    if file_exists:
-        try:
-            with open(HISTORY_CSV_PATH, "r", encoding="utf-8", newline="") as f:
-                reader = csv.DictReader(f)
-                for r in reader:
-                    if "callSid" in r and r["callSid"]:
-                        existing_sids.add(r["callSid"])
-        except Exception:
-            pass
-    # Append atomically
-    tmp_path = HISTORY_CSV_PATH.with_suffix(".tmp")
-    with open(tmp_path, "w", encoding="utf-8", newline="") as tmp:
-        writer = None
-        # Rewrite entire file when deduplicating
-        # Load existing rows
-        rows: List[Dict[str, str]] = []
-        if file_exists:
-            try:
-                with open(HISTORY_CSV_PATH, "r", encoding="utf-8", newline="") as f:
-                    reader = csv.DictReader(f)
-                    for r in reader:
-                        rows.append(r)
-            except Exception:
-                pass
-        # Add new row if not present
-        if row["callSid"] not in {r.get("callSid", "") for r in rows}:
-            rows.append(row)
-        writer = csv.DictWriter(tmp, fieldnames=headers)
-        writer.writeheader()
-        for r in rows:
-            writer.writerow({k: r.get(k, "") for k in headers})
-        tmp.flush()
-        os.fsync(tmp.fileno())
-    os.replace(tmp_path, HISTORY_CSV_PATH)
+        
+        # Use SQLite database instead of CSV file
+        persist_call_history_csv(
+            call_sid=cs.call_sid,
+            started_at=cs.started_at.isoformat(),
+            duration_sec=cs.duration_sec or 0,
+            outcome=cs.outcome,
+            transcript=json.dumps(cs.transcript, ensure_ascii=False),
+            prompt=cs.prompt_used
+        )
 
 # -------------------------
 # Live audio fan-out hub
@@ -516,17 +512,21 @@ audio_hub = LiveAudioHub()
 
 RESTART_EVENT = threading.Event()
 
-class SelfFileChangeHandler(FileSystemEventHandler):
-    def __init__(self, watch_path: Path) -> None:
-        super().__init__()
-        self.watch_path = str(watch_path)
+if FileSystemEventHandler:
+    class SelfFileChangeHandler(FileSystemEventHandler):
+        def __init__(self, watch_path: Path) -> None:
+            super().__init__()
+            self.watch_path = str(watch_path)
 
-    def on_modified(self, event):
-        if event and event.src_path and os.path.abspath(event.src_path) == os.path.abspath(self.watch_path):
-            print(color("Detected code change; scheduling graceful restart.", YELLOW))
-            RESTART_EVENT.set()
+        def on_modified(self, event):
+            if event and event.src_path and os.path.abspath(event.src_path) == os.path.abspath(self.watch_path):
+                print(color("Detected code change; scheduling graceful restart.", YELLOW))
+                RESTART_EVENT.set()
 
 def hot_reload_thread(watch_file: Path):
+    if not Observer or not FileSystemEventHandler:
+        return  # Hot reload disabled if watchdog not available
+    
     observer = Observer()
     handler = SelfFileChangeHandler(watch_file)
     observer.schedule(handler, str(watch_file.parent), recursive=False)
@@ -775,17 +775,7 @@ def get_transcript(sid: str):
         return jsonify({"ok": True, "transcript": cs.transcript, "prompt": cs.prompt_used})
 
 def load_history_rows() -> List[Dict[str, str]]:
-    rows: List[Dict[str, str]] = []
-    if not HISTORY_CSV_PATH.exists():
-        return rows
-    try:
-        with open(HISTORY_CSV_PATH, "r", encoding="utf-8", newline="") as f:
-            reader = csv.DictReader(f)
-            for r in reader:
-                rows.append(r)
-    except Exception:
-        pass
-    return rows
+    return load_history_rows_csv()
 
 @app.route("/api/scamcalls/history", methods=["GET"])
 def api_history():
@@ -1556,6 +1546,9 @@ render_template_string = _inject_assets
 # -------------------------
 
 def main():
+    # Initialize SQLite database
+    init_database()
+    
     # Start hot-reload watcher thread (watch this file)
     watch_file = Path(__file__).resolve()
     t = threading.Thread(target=hot_reload_thread, args=(watch_file,), daemon=True)

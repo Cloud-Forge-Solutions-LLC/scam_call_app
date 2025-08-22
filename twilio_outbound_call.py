@@ -27,6 +27,7 @@ import os
 import random
 import re
 import signal
+import sys
 import threading
 import time
 import urllib.request
@@ -35,6 +36,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Set
 from urllib.parse import urlparse
+
+# Add vendor directory to path for dependencies
+sys.path.insert(0, str(Path(__file__).parent / "vendor"))
 
 from flask import (
     Flask,
@@ -48,6 +52,15 @@ from flask import (
 )
 
 from werkzeug.middleware.proxy_fix import ProxyFix
+
+# Database utilities
+from database import (
+    init_database,
+    persist_call_history_json,
+    load_call_history_json,
+    scan_history_summaries,
+    compute_history_metrics,
+)
 
 # Optional bcrypt for admin auth
 try:
@@ -1114,32 +1127,20 @@ def _persist_call_history(sid: str) -> None:
     if not sid:
         return
     try:
-        payload = {
-            "sid": sid,
-            "meta": meta,
-            "transcript": transcript,
-        }
-        p = HISTORY_DIR / f"{sid}.json"
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        # Use SQLite database instead of JSON files
+        persist_call_history_json(sid, meta, transcript)
         log.info("Persisted call history for %s (%s entries).", _mask_sid(sid), len(transcript))
     except Exception as e:
         log.error("Failed to persist call history: %s", e)
 
 
 def _load_call_history(sid: str) -> Optional[Dict[str, Any]]:
-    p = HISTORY_DIR / f"{sid}.json"
-    if not p.exists():
-        return None
-    try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except Exception:
-        return None
+    return load_call_history_json(sid)
 
 
 def _scan_history_summaries(limit: int = 200) -> List[Dict[str, Any]]:
     """
-    Collect history items from the JSON history directory and optionally from a legacy CSV.
+    Collect history items from the SQLite database.
 
     Each item is a summary object with keys:
       - sid
@@ -1150,118 +1151,17 @@ def _scan_history_summaries(limit: int = 200) -> List[Dict[str, Any]]:
       - duration_seconds (int)
       - has_recordings (bool)
     """
-    items: List[Tuple[float, Dict[str, Any]]] = []
-    seen_sids: Set[str] = set()
-    try:
-        for f in HISTORY_DIR.glob("*.json"):
-            try:
-                d = json.loads(f.read_text(encoding="utf-8"))
-                meta = d.get("meta", {}) or {}
-                sid = d.get("sid", "") or ""
-                started = meta.get("started_at")
-                try:
-                    started_val = int(started) if started is not None else None
-                except Exception:
-                    started_val = None
-                out = {
-                    "sid": sid,
-                    "started_at": started_val,
-                    "completed_at": meta.get("completed_at"),
-                    "to": meta.get("to"),
-                    "from": meta.get("from"),
-                    "duration_seconds": meta.get("duration_seconds"),
-                    "has_recordings": bool(meta.get("recordings")),
-                }
-                mtime = f.stat().st_mtime
-                items.append((mtime, out))
-                if sid:
-                    seen_sids.add(sid)
-            except Exception:
-                continue
-    except Exception:
-        return []
-
-    # Now read legacy CSV history if present (avoid duplicates by SID)
-    try:
-        if HISTORY_CSV_PATH.exists():
-            try:
-                with HISTORY_CSV_PATH.open("r", encoding="utf-8", newline="") as csvf:
-                    reader = csv.DictReader(csvf)
-                    for r in reader:
-                        sid = (r.get("callSid") or r.get("callSid".lower()) or "").strip()
-                        if not sid:
-                            continue
-                        if sid in seen_sids:
-                            # prefer JSON version
-                            continue
-                        # parse startedAt (ISO8601 or epoch)
-                        started_raw = r.get("startedAt") or r.get("started_at") or ""
-                        started_at = None
-                        if started_raw:
-                            started_raw = started_raw.strip()
-                            try:
-                                # Attempt ISO parse
-                                dt = datetime.fromisoformat(started_raw)
-                                started_at = int(dt.timestamp())
-                            except Exception:
-                                try:
-                                    # fallback numeric epoch
-                                    started_at = int(float(started_raw))
-                                except Exception:
-                                    started_at = None
-                        # duration
-                        dur = 0
-                        try:
-                            dur = int(float(r.get("durationSec") or r.get("duration_sec") or r.get("duration") or 0))
-                        except Exception:
-                            dur = 0
-                        out = {
-                            "sid": sid,
-                            "started_at": started_at,
-                            "completed_at": None,
-                            "to": r.get("to") or "",
-                            "from": r.get("from") or "",
-                            "duration_seconds": dur,
-                            "has_recordings": False,
-                        }
-                        # use file mtime as ordering hint
-                        try:
-                            mtime = HISTORY_CSV_PATH.stat().st_mtime
-                        except Exception:
-                            mtime = time.time()
-                        items.append((mtime, out))
-                        seen_sids.add(sid)
-            except Exception as e:
-                log.warning("Failed to read legacy history CSV %s: %s", HISTORY_CSV_PATH, e)
-    except Exception:
-        pass
-
-    # sort by mtime desc
-    items.sort(key=lambda t: t[0], reverse=True)
-    out: List[Dict[str, Any]] = []
-    for _, obj in items[:limit]:
-        out.append(obj)
-    return out
+    return scan_history_summaries(limit)
 
 
 def _compute_history_metrics() -> Dict[str, Any]:
     """
-    Compute aggregate metrics from stored history files:
-    - total_calls: number of history files
+    Compute aggregate metrics from SQLite database:
+    - total_calls: number of call records
     - total_duration_seconds: sum of duration_seconds where present
     - average_call_seconds: computed if total_calls > 0
     """
-    summaries = _scan_history_summaries(limit=1000000)
-    total_calls = len(summaries)
-    total_duration = 0
-    for s in summaries:
-        try:
-            ds = int(s.get("duration_seconds") or 0)
-        except Exception:
-            ds = 0
-        total_duration += ds
-    avg = int(total_duration / total_calls) if total_calls else 0
-    return {"total_calls": total_calls, "total_duration_seconds": total_duration, "average_call_seconds": avg}
+    return compute_history_metrics()
 
 
 def _log_runtime_summary(context: str = "startup") -> None:
@@ -2222,6 +2122,9 @@ def health():
 
 
 def main():
+    # Initialize SQLite database
+    init_database()
+    
     log.info("Scam Call Console starting.")
     acc = os.environ.get("TWILIO_ACCOUNT_SID", "")
     if acc:
