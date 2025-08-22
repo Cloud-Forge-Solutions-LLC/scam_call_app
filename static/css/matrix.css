@@ -1,3 +1,5 @@
+/* Matrix background and layering (merged) */
+
 /* Full-screen canvas background for Matrix effect */
 .matrix-bg {
   background: #0b0f10;
@@ -10,9 +12,19 @@
   height: 100%;
   z-index: 0;
   display: block;
-  background: radial-gradient(1200px 800px at 10% 10%, rgba(0, 60, 40, 0.12), rgba(0, 0, 0, 0)) fixed,
-              radial-gradient(1200px 800px at 90% 90%, rgba(0, 60, 40, 0.12), rgba(0, 0, 0, 0)) fixed;
+
+  /* Ensure the canvas never intercepts scroll/touch/pointer events */
+  pointer-events: none;
+  touch-action: none;
+
+  /* Subtle vignette-style glow anchors */
+  background:
+    radial-gradient(1200px 800px at 10% 10%, rgba(0, 60, 40, 0.12), rgba(0, 0, 0, 0)) fixed,
+    radial-gradient(1200px 800px at 90% 90%, rgba(0, 60, 40, 0.12), rgba(0, 0, 0, 0)) fixed;
 }
 
 /* Ensure content sits above the canvas */
-.page-container { position: relative; z-index: 2; }
+.page-container {
+  position: relative;
+  z-index: 2;
+}

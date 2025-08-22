@@ -3,20 +3,33 @@
   --card: rgba(20, 22, 26, 0.75);
   --text: #f3f5f7;
   --muted: #aab2bd;
-  --accent: #25c2a0;
-  --accent-contrast: #051f1a;
+  --accent: #1ec6d8;         /* slightly brighter for better contrast */
+  --accent-contrast: #041a18; /* dark text on bright accent */
   --border: rgba(255, 255, 255, 0.12);
   --danger: #e55353;
   --shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+
+  /* Focus ring */
+  --focus-ring: rgba(30, 198, 216, 0.6);
 }
 
 * { box-sizing: border-box; }
 
-html, body {
-  height: 100%;
+/* Scrolling and layout baseline:
+   - Avoid hard 100% heights that can lock scroll on some browsers
+   - Ensure vertical scrolling is always possible
+*/
+html {
+  min-height: 100%;
+}
+
+body {
+  min-height: 100vh;
   margin: 0;
   color: var(--text);
   font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans", "Liberation Sans", "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", sans-serif;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
 }
 
 .page-container {
@@ -24,7 +37,8 @@ html, body {
   z-index: 2;
   min-height: 100%;
   padding: 1rem;
-  background: linear-gradient(to bottom, rgba(0,0,0,0.25), rgba(0,0,0,0.6));
+  /* Removed the dark overlay to restore the lighter, glassy UI */
+  background: none;
 }
 
 .page-header {
@@ -63,40 +77,86 @@ html, body {
   margin-bottom: 0.75rem;
 }
 
+/* Button system (improved contrast and affordance) */
 .btn {
   --btn-bg: #2e3340;
   --btn-fg: var(--text);
   --btn-bg-hover: #3b4152;
   --btn-bg-active: #474e62;
+
+  appearance: none;
+  -webkit-appearance: none;
   border: 1px solid var(--border);
-  background: var(--btn-bg);
+  background: linear-gradient(180deg, rgba(255,255,255,0.06), rgba(0,0,0,0.10)), var(--btn-bg);
   color: var(--btn-fg);
-  padding: 0.6rem 0.9rem;
-  border-radius: 10px;
+  padding: 0.65rem 1rem;
+  border-radius: 12px;
   cursor: pointer;
-  transition: background 0.15s ease, transform 0.05s ease;
+  transition: background 0.15s ease, transform 0.05s ease, box-shadow 0.15s ease, border-color 0.15s ease;
   text-decoration: none;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   font-size: 0.95rem;
+  box-shadow:
+    0 1px 0 rgba(255,255,255,0.04) inset,
+    0 8px 18px rgba(0,0,0,0.28);
 }
 
-.btn:hover { background: var(--btn-bg-hover); }
-.btn:active { background: var(--btn-bg-active); transform: translateY(1px); }
+.btn:hover {
+  background: linear-gradient(180deg, rgba(255,255,255,0.10), rgba(0,0,0,0.14)), var(--btn-bg-hover);
+  box-shadow:
+    0 1px 0 rgba(255,255,255,0.05) inset,
+    0 10px 22px rgba(0,0,0,0.32);
+}
 
+.btn:active {
+  background: linear-gradient(180deg, rgba(0,0,0,0.10), rgba(0,0,0,0.18)), var(--btn-bg-active);
+  transform: translateY(1px);
+  box-shadow:
+    0 0 0 rgba(0,0,0,0),
+    inset 0 1px 3px rgba(0,0,0,0.26);
+}
+
+.btn:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+  box-shadow: 0 0 0 3px var(--focus-ring), 0 8px 18px rgba(0,0,0,0.28);
+}
+
+/* High-visibility primary buttons (applies to “Call now” and others using btn-primary) */
 .btn-primary {
   --btn-bg: var(--accent);
   --btn-fg: var(--accent-contrast);
-  --btn-bg-hover: #2fd7b2;
-  --btn-bg-active: #22b090;
-  border-color: transparent;
+  --btn-bg-hover: #28d4e7; /* lighter hover */
+  --btn-bg-active: #1ab3c3; /* pressed */
+  border-color: rgba(0,0,0,0.0);
+  color: var(--btn-fg);
+  background: linear-gradient(180deg, rgba(255,255,255,0.10), rgba(0,0,0,0.12)), var(--btn-bg);
+  text-shadow: 0 1px 0 rgba(0,0,0,0.12);
 }
 
+.btn-primary:hover {
+  background: linear-gradient(180deg, rgba(255,255,255,0.14), rgba(0,0,0,0.12)), var(--btn-bg-hover);
+}
+
+.btn-primary:active {
+  background: linear-gradient(180deg, rgba(0,0,0,0.10), rgba(0,0,0,0.18)), var(--btn-bg-active);
+}
+
+/* Secondary retains subtlety but improves contrast slightly */
 .btn-secondary {
   --btn-bg: #2a2f3b;
   --btn-bg-hover: #343a49;
   --btn-bg-active: #3c4356;
+}
+
+button:disabled,
+.btn:disabled,
+[aria-disabled="true"] {
+  cursor: not-allowed;
+  opacity: 0.65;
+  filter: grayscale(8%);
 }
 
 .status-area {

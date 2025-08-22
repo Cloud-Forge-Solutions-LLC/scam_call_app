@@ -1,0 +1,32 @@
+{
+  "sid": "CA0b20d051b80615d5ba18c48face48ba5",
+  "meta": {
+    "to": "+18319460285",
+    "from_n": "+19162487450",
+    "started_at": 1755279029,
+    "completed_at": 1755279042,
+    "duration_seconds": 11,
+    "voice": "man",
+    "dialog_idx": 2
+  },
+  "transcript": [
+    {
+      "t": 1755279038.1485014,
+      "role": "Callee",
+      "text": "Hello.",
+      "final": false
+    },
+    {
+      "t": 1755279038.7240705,
+      "role": "Callee",
+      "text": "Hello.",
+      "final": false
+    },
+    {
+      "t": 1755279041.813882,
+      "role": "Callee",
+      "text": "Hello.",
+      "final": true
+    }
+  ]
+}

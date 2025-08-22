@@ -11,3 +11,9 @@ scam_app.db
 *.pyc
 __pycache__/
 *.egg-info/
+=======
+.env*
+scam_app.db
+*.db
+Added .env.test
+
