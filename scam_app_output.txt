@@ -1,0 +1,27 @@
+nohup: ignoring input
+2025-08-15 14:07:46 INFO [MainThread] scam_call_console:1503 Loaded 10 user messages from disk.
+2025-08-15 14:07:46 INFO [MainThread] scam_call_console:2154 Scam Call Console starting.
+2025-08-15 14:07:46 INFO [MainThread] scam_call_console:2157 Twilio Account SID present (masked): AC20...b55d
+2025-08-15 14:07:46 INFO [MainThread] scam_call_console:572 Twilio HTTP client configured with timeout=10s.
+2025-08-15 14:07:46 INFO [MainThread] scam_call_console:578 Twilio client initialized (account SID present).
+2025-08-15 14:07:46 INFO [MainThread] scam_call_console:1231 Runtime summary (startup): to=, from_single=, from_pool=-, public_url_set=False, active_hours=09:00-18:00 on Mon,Tue,Wed,Thu,Fri, interval=120s..420s, caps(hour/day)=3/20, rotate_prompts=True, media_streams=False, use_ngrok=False, ready_to_call=False, reasons=['missing_to_number', 'missing_from_number', 'missing_public_base_url']
+2025-08-15 14:07:46 INFO [MainThread] scam_call_console:1932 Ngrok disabled (USE_NGROK=false).
+2025-08-15 14:07:46 INFO [dialer-thread] scam_call_console:969 Dialer thread started.
+2025-08-15 14:07:46 INFO [MainThread] scam_call_console:1983 Background dialer thread started.
+2025-08-15 14:07:46 INFO [dialer-thread] scam_call_console:916 Initialized schedule: next_call_epoch=1755292282 (in 216s), interval_total=216s
+2025-08-15 14:07:46 INFO [MainThread] scam_call_console:2164 Starting Flask on 0.0.0.0:8080 (debug=False)
+ * Serving Flask app 'twilio_outbound_call'
+ * Debug mode: off
+2025-08-15 14:07:46 INFO [MainThread] werkzeug:224 [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:8080
+ * Running on http://192.168.1.23:8080
+2025-08-15 14:07:46 INFO [MainThread] werkzeug:224 [33mPress CTRL+C to quit[0m
+2025-08-15 14:07:49 INFO [Thread-1 (process_request_thread)] scam_call_console:1269 GET /scamcalls/history
+2025-08-15 14:07:49 INFO [Thread-1 (process_request_thread)] werkzeug:224 98.41.114.149 - - [15/Aug/2025 14:07:49] "GET /scamcalls/history HTTP/1.1" 200 -
+2025-08-15 14:07:49 INFO [Thread-2 (process_request_thread)] werkzeug:224 98.41.114.149 - - [15/Aug/2025 14:07:49] "[36mGET /static/scamcalls.css HTTP/1.1[0m" 304 -
+2025-08-15 14:07:49 INFO [Thread-3 (process_request_thread)] werkzeug:224 98.41.114.149 - - [15/Aug/2025 14:07:49] "[36mGET /static/css/matrix.css HTTP/1.1[0m" 304 -
+2025-08-15 14:07:49 INFO [Thread-4 (process_request_thread)] werkzeug:224 98.41.114.149 - - [15/Aug/2025 14:07:49] "GET /api/history HTTP/1.1" 200 -
+2025-08-15 14:07:49 INFO [Thread-5 (process_request_thread)] werkzeug:224 98.41.114.149 - - [15/Aug/2025 14:07:49] "[36mGET /static/favicon.svg HTTP/1.1[0m" 304 -
+2025-08-15 14:07:52 INFO [Thread-6 (process_request_thread)] werkzeug:224 98.41.114.149 - - [15/Aug/2025 14:07:52] "GET /api/history/CAc0db9dc310d17268c5f2644e81926bd8 HTTP/1.1" 200 -
+2025-08-15 14:07:54 INFO [Thread-7 (process_request_thread)] werkzeug:224 98.41.114.149 - - [15/Aug/2025 14:07:54] "GET /api/history/CA5a39c8536ba04ccd31e6769bf9bd396b HTTP/1.1" 200 -

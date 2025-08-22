@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Admin Login</title>
+  <link rel="icon" href="/static/favicon.svg" />
+  <link rel="stylesheet" href="/static/scamcalls.css" />
+  <link rel="stylesheet" href="/static/css/matrix.css" />
+</head>
+<body class="matrix-bg">
+  <canvas id="matrix-canvas" aria-hidden="true"></canvas>
+
+  <main class="page-container">
+    <header class="page-header">
+      <h1 class="app-title"><span class="brand-mark">SC</span> Scam Call Console</h1>
+      <nav class="header-actions">
+        <a class="btn btn-secondary" href="/scamcalls">Back</a>
+      </nav>
+    </header>
+
+    <section class="card" style="max-width: 480px; margin: 2rem auto;">
+      <h2>Administrator Sign In</h2>
+      {% if error %}
+      <div class="alert alert-danger" role="alert">{{ error }}</div>
+      {% endif %}
+      <form class="form-grid" action="/admin/login" method="post" novalidate>
+        <label for="username">Username</label>
+        <input id="username" name="username" type="text" autocomplete="username" required />
+
+        <label for="password">Password</label>
+        <input id="password" name="password" type="password" autocomplete="current-password" required />
+
+        <div class="form-actions">
+          <button class="btn btn-primary" type="submit">Sign in</button>
+        </div>
+      </form>
+      <p class="form-help">
+        Default for now: user “bootycall”, password “scammers”.
+      </p>
+    </section>
+  </main>
+
+  <script src="/static/js/matrix-rain.js"></script>
+  <script src="/static/js/theme-enhance.js"></script>
+</body>
+</html>

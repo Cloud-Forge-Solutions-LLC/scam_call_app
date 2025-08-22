@@ -1,5 +1,6 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
+
   <head>
     <meta charset="utf-8" />
     <title>Scam Call Monitor</title>
@@ -70,23 +71,43 @@
         <a href="/scamcalls" aria-current="page">Live</a>
         <a href="/scamcalls/history">History</a>
         <button id="adminBtn" class="button admin-btn" type="button">Admin</button>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Scam Call Console</title>
+  <link rel="icon" href="/static/favicon.svg" />
+  <link rel="stylesheet" href="/static/scamcalls.css" />
+  <link rel="stylesheet" href="/static/css/matrix.css" />
+</head>
+<body class="matrix-bg" data-is-admin="{{ '1' if is_admin else '0' }}">
+  <canvas id="matrix-canvas" aria-hidden="true"></canvas>
+
+  <main class="page-container">
+    <header class="page-header">
+      <h1 class="app-title"><span class="brand-mark">SC</span> Scam Call Console</h1>
+      <nav class="header-actions" aria-label="Primary actions">
+        <a class="btn btn-secondary" href="/scamcalls/history" title="View call history">History</a>
+        {% if is_admin %}
+          <a class="btn btn-secondary" href="/admin/logout" id="btnLogout" title="Log out">Logout</a>
+        {% else %}
+          <a class="btn btn-secondary" href="/admin/login" id="btnAdminLogin" title="Administrator login">Admin</a>
+        {% endif %}
+
       </nav>
     </header>
 
-    <main>
-      <div class="panel">
-        <div style="display:flex; align-items:center; justify-content: space-between; margin-bottom: 12px;">
-          <div style="display:flex; align-items:center; gap:8px;">
-            <div style="font-weight:700;">Next Outbound Call</div>
-            <span id="statusDot" class="status-dot idle"></span>
-          </div>
-          <div class="meta">
-            <div>Destination</div><div id="destNumber">—</div>
-            <div>From</div><div id="fromNumber">—</div>
-            <div>Window</div><div id="activeWindow">—</div>
-            <div>Caps</div><div id="caps" class="caps">—</div>
-          </div>
-        </div>
+    <section class="card" role="region" aria-labelledby="console-controls">
+      <div class="controls-row" id="console-controls">
+        <button id="btnCallNow" class="btn btn-primary" type="button" aria-label="Call now">Call now</button>
+        <button id="btnAddGreeting" class="btn" type="button" aria-label="Add greeting phrase">Add greeting phrase</button>
+
+        <!-- Links to related pages (speech settings, caller messages) -->
+        <a class="btn btn-secondary" href="/scamcalls/speech" id="btnSpeechSettings" role="button" aria-label="Speech settings">Speech settings</a>
+        <a class="btn btn-secondary" href="/scamcalls/messages" id="btnMessages" role="button" aria-label="Caller messages">Caller messages</a>
+      </div>
+
+      <!-- Metrics: total calls, total call time -->
+      <div id="metricsArea" style="margin-top:0.8rem;"></div>
 
         <div class="grid">
           <!-- Countdown panel -->
@@ -110,27 +131,52 @@
             </div>
           </div>
 
-          <!-- Active call panel -->
-          <div id="callPanel" class="hidden">
-            <div style="display:flex; align-items:center; gap:12px; margin-bottom:8px; justify-content: space-between;">
-              <div class="inline">
-                <div style="font-weight:700;">Active Call</div>
-                <span id="callStatusBadge" class="button">Connected</span>
-                <div>SID: <span id="callSid">—</span></div>
-              </div>
-              <div class="inline">
-                <button id="listenBtn" class="button" type="button" title="Play live audio">Listen Live</button>
-              </div>
-            </div>
-            <div id="conversation" class="conversation"></div>
-          </div>
-        </div>
+      <div id="statusArea" class="status-area" aria-live="polite" aria-atomic="true"></div>
 
-        <footer>
-          <div id="appStatus">Status: Initializing...</div>
-        </footer>
+
+      {% if is_admin %}
+      <hr />
+      <section id="adminPanel" class="admin-panel" aria-labelledby="admin-panel-title">
+        <div class="admin-panel__header">
+          <h2 id="admin-panel-title">Admin Settings</h2>
+          <p class="muted">
+            Update non-secret configuration values. Values are loaded from the server and persisted back to .env.
+          </p>
+        </div>
+        <!-- envEditor is rendered by JS as a responsive table on desktop and stacked cards on mobile -->
+        <div id="envEditor" class="env-editor" data-endpoint-get="/api/admin/env" data-endpoint-post="/api/admin/env" aria-busy="true" aria-live="polite">
+          <div class="skeleton-row" aria-hidden="true"></div>
+          <div class="skeleton-row" aria-hidden="true"></div>
+          <div class="skeleton-row" aria-hidden="true"></div>
+        </div>
+        <div class="form-actions">
+          <button id="btnSaveEnv" class="btn btn-primary" type="button" disabled>Save settings</button>
+        </div>
+      </section>
+      {% endif %}
+    </section>
+
+    <div id="greetingModal" class="modal" aria-hidden="true" role="dialog" aria-modal="true" aria-labelledby="greetingModalTitle">
+      <div class="modal__dialog" role="document">
+        <div class="modal__header">
+          <h3 id="greetingModalTitle">One-time greeting phrase</h3>
+          <button class="modal__close" type="button" aria-label="Close" id="greetingCloseBtn">×</button>
+        </div>
+        <div class="modal__body">
+          <p>Enter a short phrase for the caller to say at the beginning of the next call. Keep it between 5 and 15 words.</p>
+          <textarea id="greetingInput" rows="3" maxlength="200" placeholder="Example: I am following up about your extended warranty."></textarea>
+          <div class="muted" id="greetingWordCount">0 words</div>
+        </div>
+        <div class="modal__footer">
+          <button class="btn btn-secondary" type="button" id="greetingCancelBtn">Cancel</button>
+          <button class="btn btn-primary" type="button" id="greetingSaveBtn" disabled>Save</button>
+        </div>
       </div>
-    </main>
+    </div>
+
+    <div id="toast" class="toast" role="status" aria-live="polite" aria-atomic="true"></div>
+  </main>
+
 
     <!-- Admin Login Modal -->
     <div id="adminLoginModal" class="modal hidden">
@@ -194,4 +240,10 @@
     <script src="/static/scamcalls.js"></script>
     <link rel="stylesheet" href="/static/matrix.css">
   </body>
+
+  <script src="/static/js/matrix-rain.js"></script>
+  <script src="/static/scamcalls.js"></script>
+  <script src="/static/js/theme-enhance.js"></script>
+</body>
+
 </html>

@@ -1,1600 +1,2180 @@
 #!/usr/bin/env python3
 """
-Twilio outbound caller with web UI (/scamcalls) and live audio monitor.
+Scam Call Console: Outbound caller service with admin UI, pacing, Twilio voice,
+optional Media Streams, live transcript API, history APIs, speech settings, message rotation,
+and clean shutdown.
 
-Key capabilities
-- Outbound call attempts on a randomized interval between MIN_INTERVAL_SECONDS and MAX_INTERVAL_SECONDS.
-- UI at /scamcalls shows a live transcript when connected and a countdown ring between calls.
-- Optional "Call now" to immediately request an attempt (respects active window, caps, cooldowns).
-- Live audio monitor on /scamcalls via Twilio Media Streams relayed to the browser through WebSockets.
-  Note: Twilio Media Streams do not add a separate feature charge beyond normal voice minutes.
-- Status handling and transcript/history collection with CSV persistence across restarts.
-- Non-blocking startup for background runs: if no input within 10 seconds (or no TTY), proceed with defaults.
-- Rotating opening messages per call (sequential or random).
-- Always use a random FROM number when FROM_NUMBERS is provided.
+Diagnostic build:
+- Adds comprehensive logging for call placement and scheduling
+- Fixes a deadlock that prevented placing calls (nested _PARAMS_LOCK acquisition)
+- Optional Twilio SDK HTTP debug logs via TWILIO_SDK_DEBUG=true
 
-Requirements
-- Python 3.8+
-- pip install twilio flask pyngrok python-dotenv flask-sock simple-websocket
+Notes:
+- Do not store real secrets in source control; keep .env private.
+- Phone numbers and SIDs are masked in logs to reduce exposure.
+- All logs go to stdout using Python logging.
 """
 
-import os
-import re
-import sys
+from __future__ import annotations
+
+import atexit
+import asyncio
+import base64
 import csv
 import json
-import time
-import random
-import signal
 import logging
+import os
+import random
+import re
+import signal
+import sys
 import threading
-from datetime import datetime, timedelta
-from typing import Optional, Tuple, Set, Dict, Any, List
+import time
+import urllib.request
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, Set
+from urllib.parse import urlparse
 
-# Optional .env auto-load
+# Add vendor directory to path for dependencies
+sys.path.insert(0, str(Path(__file__).parent / "vendor"))
+
+from flask import (
+    Flask,
+    Response,
+    jsonify,
+    redirect,
+    render_template,
+    request,
+    session,
+    url_for,
+)
+
+from werkzeug.middleware.proxy_fix import ProxyFix
+
+# Database utilities
+from database import (
+    init_database,
+    persist_call_history_json,
+    load_call_history_json,
+    scan_history_summaries,
+    compute_history_metrics,
+)
+
+# Optional bcrypt for admin auth
 try:
-    from dotenv import load_dotenv
-    load_dotenv()
+    import bcrypt  # type: ignore
 except Exception:
-    pass
+    bcrypt = None  # type: ignore
 
-# Ensure pyngrok uses local binary if set (optional)
-os.environ.setdefault("NGROK_PATH", "/opt/homebrew/bin/ngrok")
-
-from flask import Flask, request, Response, render_template, jsonify, send_from_directory
-
-# WebSockets
+# Twilio client and TwiML helpers
 try:
-    from flask_sock import Sock
+    from twilio.rest import Client  # type: ignore
 except Exception:
-    print("Missing dependency: pip install flask-sock simple-websocket", file=sys.stderr)
-    raise
-
-# Requests is used by the Twilio SDK
-try:
-    import requests
-except Exception:
-    requests = None
+    Client = None  # type: ignore
 
 try:
-    from twilio.rest import Client
-    from twilio.base.exceptions import TwilioRestException
-    from twilio.http.http_client import TwilioHttpClient
+    from twilio.twiml.voice_response import VoiceResponse, Start, Stream, Gather  # type: ignore
 except Exception:
-    print("Missing dependency: pip install twilio", file=sys.stderr)
-    raise
+    VoiceResponse = None  # type: ignore
+    Start = None  # type: ignore
+    Stream = None  # type: ignore
+    Gather = None  # type: ignore
+
+# Optional: Twilio custom HTTP client for timeouts
+try:
+    from twilio.http.http_client import TwilioHttpClient  # type: ignore
+except Exception:
+    TwilioHttpClient = None  # type: ignore
 
 # Optional ngrok
 try:
-    from pyngrok import ngrok, conf as ngrok_conf
-    from pyngrok.conf import PyngrokConfig
-    _HAS_NGROK = True
+    from pyngrok import ngrok as ngrok_lib  # type: ignore
 except Exception:
-    _HAS_NGROK = False
+    ngrok_lib = None  # type: ignore
 
-# Prompts file
+# Optional WebSocket support for Media Streams
+_sock = None
 try:
-    from rotating_iv_prompts import PROMPTS as ROTATING_PROMPTS
+    from flask_sock import Sock  # type: ignore
 except Exception:
-    ROTATING_PROMPTS = []
+    Sock = None  # type: ignore
 
-# Flask app and WebSocket sock
-app = Flask(__name__)
-sock = Sock(app)
-
-# Globals
-_STOP_REQUESTED = False
-ANSI_BOLD = ""
-ANSI_CYAN = ""
-ANSI_RESET = ""
-
-# Runtime configuration
-_TTS_VOICE: str = os.getenv("TTS_VOICE", "man").strip() or "man"
-_TTS_LANGUAGE: str = os.getenv("TTS_LANGUAGE", "en-US").strip() or "en-US"
-_COMPANY_NAME: str = os.getenv("COMPANY_NAME", "Your Company").strip() or "Your Company"
-_TOPIC: str = os.getenv("TOPIC", "engine replacement").strip() or "engine replacement"
-
-_GREETING_WAIT_TIMEOUT_S: int = max(1, min(10, int(os.getenv("GREETING_WAIT_TIMEOUT_SECONDS", "3"))))
-_GREETING_MAX_CYCLES: int = max(1, int(os.getenv("GREETING_MAX_CYCLES", "3")))
-_DEFAULT_GREETING_KEYWORDS = [
-    "hello", "hi", "hey", "good morning", "good afternoon", "good evening",
-    "this is", "speaking", "yes", "how are you", "how can i help", "go ahead"
-]
-_GREETING_KEYWORDS: List[str] = [kw.strip().lower() for kw in os.getenv(
-    "GREETING_KEYWORDS",
-    ",".join(_DEFAULT_GREETING_KEYWORDS)
-).split(",") if kw.strip()]
-
-_ENABLE_AMD: bool = os.getenv("ENABLE_AMD", "false").strip().lower() in {"1", "true", "yes", "on"}
-_AMD_MODE: str = os.getenv("AMD_MODE", "Enable").strip() or "Enable"
+# Optional rotating prompts used for professional follow-ups
 try:
-    _AMD_TIMEOUT_S: int = max(3, min(59, int(os.getenv("AMD_TIMEOUT_SECONDS", "20"))))
-except ValueError:
-    _AMD_TIMEOUT_S = 20
-
-# Recording configuration
-_ENABLE_RECORDING_ENV: bool = os.getenv("ENABLE_RECORDING", "false").strip().lower() in {"1", "true", "yes", "on"}
-_RECORD_CALLS: bool = _ENABLE_RECORDING_ENV or (os.getenv("RECORD_CALLS", "false").strip().lower() in {"1", "true", "yes", "on"})
-_RECORDING_CHANNELS: str = os.getenv("RECORDING_CHANNELS", "mono").strip().lower() or "mono"
-_RECORDING_STATUS_EVENTS: List[str] = [e.strip() for e in os.getenv("RECORDING_STATUS_EVENTS", "in-progress,completed").split(",") if e.strip()]
-
-# Pacing
-try:
-    _MIN_INTERVAL_S = max(30, int(os.getenv("MIN_INTERVAL_SECONDS", "120")))
-except ValueError:
-    _MIN_INTERVAL_S = 120
-try:
-    _MAX_INTERVAL_S = max(_MIN_INTERVAL_S, int(os.getenv("MAX_INTERVAL_SECONDS", "420")))
-except ValueError:
-    _MAX_INTERVAL_S = max(_MIN_INTERVAL_S, 420)
-
-try:
-    _DAILY_MAX_PER_DEST = max(1, int(os.getenv("DAILY_MAX_ATTEMPTS_PER_DEST", "12")))
-except ValueError:
-    _DAILY_MAX_PER_DEST = 12
-try:
-    _HOURLY_MAX_PER_DEST = max(1, int(os.getenv("HOURLY_MAX_ATTEMPTS_PER_DEST", "3")))
-except ValueError:
-    _HOURLY_MAX_PER_DEST = 3
-
-_ACTIVE_HOURS_LOCAL = os.getenv("ACTIVE_HOURS_LOCAL", "09:00-18:00").strip()
-_ACTIVE_DAYS = [d.strip().title() for d in os.getenv("ACTIVE_DAYS", "Mon,Tue,Wed,Thu,Fri").split(",") if d.strip()]
-_BACKOFF_STRATEGY = os.getenv("BACKOFF_STRATEGY", "none").strip().lower()
-
-# Caps
-try:
-    _MAX_CALL_DURATION_S = max(10, int(os.getenv("MAX_CALL_DURATION_SECONDS", "60")))
-except ValueError:
-    _MAX_CALL_DURATION_S = 60
-
-# Silence hangup
-try:
-    _CALLEE_SILENCE_HANGUP_S = max(5, min(60, int(os.getenv("CALLEE_SILENCE_HANGUP_SECONDS", "10"))))
-except ValueError:
-    _CALLEE_SILENCE_HANGUP_S = 10
-
-# Non-interactive, mirroring
-_NONINTERACTIVE = os.getenv("NONINTERACTIVE", "false").strip().lower() in {"1", "true", "yes", "on"}
-_MIRROR_DIR = os.getenv("MIRROR_TRANSCRIPTS_DIR", "").strip() or ""
-
-# History persistence (CSV)
-_HISTORY_CSV_PATH = os.getenv("HISTORY_CSV_PATH", os.path.join(".", "data", "call_history.csv"))
-_history_file_lock = threading.Lock()
-_persisted_call_sids: Set[str] = set()
-
-# Twilio client (initialized in main)
-_TWILIO_CLIENT: Optional[Client] = None
-
-# In-memory call state
-_call_state_lock = threading.Lock()
-# CallSid -> {...}
-_call_state: Dict[str, Dict[str, Any]] = {}
-
-# Diagnostics
-_diag_lock = threading.Lock()
-_call_diag: Dict[str, Dict[str, Any]] = {}
-
-# Attempt tracking
-_attempts_lock = threading.Lock()
-_dest_attempts: Dict[str, List[float]] = {}
-_dest_backoff: Dict[str, Dict[str, Any]] = {}
-
-# FROM numbers
-_from_lock = threading.Lock()
-_FROM_NUMBERS: List[str] = []
-try:
-    _FROM_COOLDOWN_MIN = max(0, int(os.getenv("FROM_NUMBER_MIN_COOLDOWN_MIN", "30")))
-except ValueError:
-    _FROM_COOLDOWN_MIN = 30
-# When a pool is provided, this build uses a purely random pick per attempt.
-
-# Web UI support state
-_PUBLIC_BASE_URL: Optional[str] = None
-_DEST_NUMBER: Optional[str] = None
-_last_from_number: Optional[str] = None
-_next_call_epoch_s: Optional[int] = None
-_next_call_start_epoch_s: Optional[int] = None
-
-_history_lock = threading.Lock()
-# List of dicts: {callSid, startedAt, durationSec, outcome, transcript:[{role, text, ts}], prompt: str}
-_history: List[Dict[str, Any]] = []
-
-# Manual "Call now" signal
-_manual_call_requested = threading.Event()
-
-# Prompt rotation settings
-_ROTATE_PROMPTS = os.getenv("ROTATE_PROMPTS", "true").strip().lower() in {"1", "true", "yes", "on"}
-_ROTATE_PROMPTS_STRATEGY = os.getenv("ROTATE_PROMPTS_STRATEGY", "sequential").strip().lower()  # "sequential" or "random"
-_prompts_list: List[str] = [str(p).strip() for p in ROTATING_PROMPTS if str(p).strip()]
-_prompt_lock = threading.Lock()
-_prompt_index = 0
-_last_random_index: Optional[int] = None
-
-# Live audio: connected browser clients
-_audio_clients_lock = threading.Lock()
-_audio_clients: Set[Any] = set()  # set of WebSocket objects
+    from rotating_iv_prompts import PROMPTS as IV_PROMPTS  # type: ignore
+except Exception:
+    IV_PROMPTS = []  # type: ignore
 
 
-def setup_logging() -> None:
-    global ANSI_BOLD, ANSI_CYAN, ANSI_RESET
-    color_enabled = os.getenv("LOG_COLOR", "1").strip().lower() not in {"0", "false", "no", "off"}
-    ANSI_BOLD = "\033[1m" if color_enabled else ""
-    ANSI_CYAN = "\033[36m" if color_enabled else ""
-    ANSI_RESET = "\033[0m" if color_enabled else ""
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-        datefmt="%-Y-%m-%d %H:%M:%S" if sys.platform != "win32" else "%Y-%m-%d %H:%M:%S",
-    )
+# ---------- Logging setup ----------
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s %(levelname)s [%(threadName)s] %(name)s:%(lineno)d %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger("scam_call_console")
 
-
-def _handle_stop(signum, frame):
-    global _STOP_REQUESTED
-    _STOP_REQUESTED = True
-    logging.info("Stop requested; exiting after current cycle.")
-
-
-def _escape_xml(text: str) -> str:
-    return (
-        text.replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-        .replace('"', "&quot;")
-        .replace("'", "&apos;")
-    )
-
-
-def _recording_enabled() -> bool:
-    return _RECORD_CALLS
-
-
-def _ensure_diag_state(call_sid: str) -> Dict[str, Any]:
-    with _diag_lock:
-        d = _call_diag.get(call_sid)
-        if d is None:
-            d = {}
-            _call_diag[call_sid] = d
-        d.setdefault("created_ts", time.time())
-        d.setdefault("events", [])
-        d.setdefault("ringing_ts", None)
-        d.setdefault("answered_ts", None)
-        d.setdefault("answered_by", None)
-        d.setdefault("final_status", None)
-        d.setdefault("sip_code", None)
-        d.setdefault("duration", None)
-        d.setdefault("recording_urls", [])
-        d.setdefault("recording_sids", [])
-        d.setdefault("from_number", None)
-        d.setdefault("interval_chosen_s", None)
-        d.setdefault("backoff_applied_s", 0)
-        d.setdefault("prompt", None)
-        return d
-
-
-def _ensure_call_state(call_sid: str) -> None:
-    with _call_state_lock:
-        if call_sid not in _call_state:
-            log_path = None
-            if _MIRROR_DIR:
-                try:
-                    os.makedirs(_MIRROR_DIR, exist_ok=True)
-                    log_path = os.path.join(_MIRROR_DIR, f"call_{call_sid}.log")
-                except Exception:
-                    log_path = None
-            _call_state[call_sid] = {
-                "start_ts": time.time(),
-                "timer": None,
-                "segments": [],
-                "closed": False,
-                "fsm_state": "WAIT_HELLO",
-                "live_utterance": {"buffer": "", "last_partial_ts": 0.0, "inactivity_timer": None},
-                "context": {
-                    "year": None, "make": None, "model": None,
-                    "engine": None, "vin8": None, "location": None,
-                    "budget": None, "timeline": None, "agreed": None
-                },
-                "seq": 1,
-                "log_path": log_path,
-            }
-    _ensure_diag_state(call_sid)
-
-
-def _write_mirror(call_sid: str, line: str) -> None:
-    with _call_state_lock:
-        st = _call_state.get(call_sid)
-        if not st:
-            return
-        path = st.get("log_path")
-    if path:
-        try:
-            with open(path, "a", encoding="utf-8") as f:
-                f.write(line + "\n")
-        except Exception:
-            pass
-
-
-def _append_line(call_sid: str, role: str, text: str) -> None:
-    if not text:
-        return
-    labeled = f"{role}: {text}"
-    with _call_state_lock:
-        st = _call_state.get(call_sid)
-        if not st:
-            return
-        st["segments"].append(labeled)
-    header = f"{ANSI_BOLD}{ANSI_CYAN}=== {role} line (CallSid={call_sid}) ==={ANSI_RESET}"
-    footer = f"{ANSI_BOLD}{ANSI_CYAN}=== End {role} line ==={ANSI_RESET}"
-    logging.info("\n%s\n%s\n%s", header, labeled, footer)
-    _write_mirror(call_sid, labeled)
-
-
-def _append_partial_callee(call_sid: str, text: str) -> None:
-    if not text:
-        return
-    labeled = f"Callee (partial): {text}..."
-    header = f"{ANSI_BOLD}{ANSI_CYAN}=== Callee partial (CallSid={call_sid}) ==={ANSI_RESET}"
-    footer = f"{ANSI_BOLD}{ANSI_CYAN}=== End partial ==={ANSI_RESET}"
-    logging.info("\n%s\n%s\n%s", header, labeled, footer)
-    _write_mirror(call_sid, labeled)
-
-
-def _append_callee_line(call_sid: str, text: str) -> None:
-    _append_line(call_sid, "Callee", text)
-
-
-def _append_assistant_line(call_sid: str, text: str) -> None:
-    _append_line(call_sid, "Assistant", text)
-
-
-def _finalize_transcript(call_sid: str) -> str:
-    with _call_state_lock:
-        st = _call_state.get(call_sid)
-        if not st:
-            return ""
-        full_text = "\n".join(st["segments"]).strip()
-        st["closed"] = True
-    header = f"{ANSI_BOLD}{ANSI_CYAN}===== Full conversation (CallSid={call_sid}) ====={ANSI_RESET}"
-    footer = f"{ANSI_BOLD}{ANSI_CYAN}===== End conversation ====={ANSI_RESET}"
-    if full_text:
-        logging.info("\n%s\n%s\n%s", header, full_text, footer)
-    else:
-        logging.info("\%s\n%s\n%s", header, "<no speech captured>", footer)
-    return full_text
-
-
-def _schedule_forced_hangup(call_sid: str, seconds: int) -> None:
-    def _hangup():
-        try:
-            client = _TWILIO_CLIENT
-            if client is None:
-                return
-            client.calls(call_sid).update(status="completed")
-            logging.info("Forced hangup triggered at %ss for CallSid=%s", seconds, call_sid)
-        except Exception as e:
-            logging.error("Failed to force hangup for CallSid=%s: %s", call_sid, str(e))
-
-    with _call_state_lock:
-        st = _call_state.get(call_sid)
-        if not st:
-            return
-        if st.get("timer"):
-            try:
-                st["timer"].cancel()
-            except Exception:
-                pass
-        t = threading.Timer(seconds, _hangup)
-        st["timer"] = t
-        t.daemon = True
-        t.start()
-
-
-def _cancel_forced_hangup(call_sid: str) -> None:
-    with _call_state_lock:
-        st = _call_state.get(call_sid)
-        if not st:
-            return
-        t = st.get("timer")
-        if t:
-            try:
-                t.cancel()
-            except Exception:
-                pass
-        st["timer"] = None
-
-
-def _record_event(call_sid: str, event: str, call_status: str, answered_by: Optional[str], sip_code: Optional[str], duration: Optional[str]) -> None:
-    now = time.time()
-    d = _ensure_diag_state(call_sid)
-    with _diag_lock:
-        d["events"].append({
-            "t": now,
-            "event": event,
-            "call_status": call_status,
-            "answered_by": answered_by,
-            "sip_code": sip_code,
-            "duration": duration,
-        })
-        if event == "ringing" and d.get("ringing_ts") is None:
-            d["ringing_ts"] = now
-        if event == "answered":
-            d["answered_ts"] = now
-            if answered_by:
-                d["answered_by"] = answered_by
-        if event == "completed":
-            d["final_status"] = call_status
-            if sip_code:
-                d["sip_code"] = sip_code
-            if duration is not None:
-                d["duration"] = duration
-
-
-def _classify_outcome(call_sid: str) -> str:
-    with _diag_lock:
-        d = _call_diag.get(call_sid, {})
-
-    ans_by = (d.get("answered_by") or "").lower()
-    ring_ts = d.get("ringing_ts")
-    ans_ts = d.get("answered_ts")
-    final_status = (d.get("final_status") or "").lower()
-    sip = d.get("sip_code")
+# Optional Twilio SDK HTTP debug (disabled by default)
+if str(os.environ.get("TWILIO_SDK_DEBUG", "false")).strip().lower() in {"1", "true", "yes", "on"}:
     try:
-        duration_s = int(d.get("duration")) if d.get("duration") is not None else None
-    except Exception:
-        duration_s = None
-
-    if ans_by.startswith("human"):
-        return "Human answered"
-    if ans_by.startswith("machine"):
-        if ans_ts is not None:
-            if ring_ts is None or (ans_ts - d.get("created_ts", ans_ts)) < 3:
-                return "Voicemail or immediate forward"
-            if ring_ts is not None and (ans_ts - ring_ts) >= 10:
-                return "No answer; voicemail after ringing"
-        return "Voicemail detected"
-    if final_status == "busy" or sip in {"486"}:
-        return "Busy"
-    if final_status == "failed" or sip in {"603", "607", "403"}:
-        return "Declined/Blocked"
-    if final_status in {"no-answer", "canceled"}:
-        return "No answer"
-    if final_status == "completed" and (duration_s == 0):
-        return "Completed with zero duration"
-    return "Outcome unknown"
+        logging.getLogger("twilio").setLevel(logging.DEBUG)
+        logging.getLogger("twilio.http_client").setLevel(logging.DEBUG)
+        logging.getLogger("twilio.http").setLevel(logging.DEBUG)
+        logging.getLogger("urllib3").setLevel(logging.DEBUG)
+        log.info("Twilio SDK HTTP debug logging enabled (TWILIO_SDK_DEBUG=true).")
+    except Exception as _e:
+        log.warning("Failed to enable Twilio SDK debug logging: %s", _e)
 
 
-def twiml_response(xml: str) -> Response:
-    return Response(xml, status=200, mimetype="text/xml")
+def _mask_phone(val: Optional[str]) -> str:
+    s = (val or "").strip()
+    if not s:
+        return ""
+    digits = "".join(ch for ch in s if ch.isdigit() or ch == "+")
+    if len(digits) <= 4:
+        return f"...{digits}"
+    return f"...{digits[-4:]}"
 
 
-def _utterance_inactivity_commit(call_sid: str) -> None:
-    with _call_state_lock:
-        st = _call_state.get(call_sid)
-        if not st:
-            return
-        live = st["live_utterance"]
-        text = live.get("buffer", "").strip()
-        live["buffer"] = ""
-        live["inactivity_timer"] = None
-    if text:
-        _append_callee_line(call_sid, text)
+def _mask_sid(sid: Optional[str]) -> str:
+    s = (sid or "").strip()
+    if len(s) <= 6:
+        return s
+    return f"{s[:4]}...{s[-4:]}"
 
 
-def _buffer_partial(call_sid: str, partial: str, inactivity_ms: int = 1000) -> None:
-    now = time.time()
-    with _call_state_lock:
-        st = _call_state.get(call_sid)
-        if not st:
-            return
-        live = st["live_utterance"]
-        live["buffer"] = partial
-        live["last_partial_ts"] = now
-        tmr: Optional[threading.Timer] = live.get("inactivity_timer")
-        if tmr:
-            try:
-                tmr.cancel()
-            except Exception:
-                pass
-        t = threading.Timer(inactivity_ms / 1000.0, _utterance_inactivity_commit, args=(call_sid,))
-        t.daemon = True
-        live["inactivity_timer"] = t
-        t.start()
+def _xml_escape(s: str) -> str:
+    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;").replace("'", "&apos;")
 
 
-def _clear_live_utterance(call_sid: str) -> None:
-    with _call_state_lock:
-        st = _call_state.get(call_sid)
-        if not st:
-            return
-        live = st["live_utterance"]
-        live["buffer"] = ""
-        tmr = live.get("inactivity_timer")
-        if tmr:
-            try:
-                tmr.cancel()
-            except Exception:
-                pass
-        live["inactivity_timer"] = None
+app = Flask(__name__, static_folder="static", template_folder="templates")
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_host=1)  # type: ignore
+app.secret_key = os.environ.get("FLASK_SECRET", os.urandom(32))
 
 
-def _parse_active_window(active_str: str) -> Tuple[int, int]:
+TRUE_SET = {"1", "true", "yes", "on", "y", "t"}
+
+
+def _parse_bool(s: Optional[str], default: bool = False) -> bool:
+    if s is None:
+        return default
+    return str(s).strip().lower() in TRUE_SET
+
+
+def _parse_int(s: Optional[str], default: int) -> int:
     try:
-        s, e = active_str.split("-")
-        hs, ms = [int(x) for x in s.strip().split(":")]
-        he, me = [int(x) for x in e.strip().split(":")]
-        return hs * 60 + ms, he * 60 + me
+        return int(str(s).strip())
     except Exception:
-        return 9 * 60, 18 * 60
+        return default
+
+
+def _parse_csv(s: Optional[str]) -> List[str]:
+    if not s:
+        return []
+    return [p.strip() for p in str(s).split(",") if p.strip()]
 
 
 def _now_local() -> datetime:
-    return datetime.now()
+    try:
+        return datetime.now().astimezone()
+    except Exception:
+        return datetime.now()
 
 
-def _within_active_window(now_dt: datetime) -> bool:
-    day = now_dt.strftime("%a")
-    if day not in _ACTIVE_DAYS:
-        return False
-    start_min, end_min = _parse_active_window(_ACTIVE_HOURS_LOCAL)
-    mins = now_dt.hour * 60 + now_dt.minute
-    if start_min <= end_min:
-        return start_min <= mins < end_min
-    return mins >= start_min or mins < end_min
+def _load_dotenv_pairs(path: str) -> List[Tuple[str, str]]:
+    pairs: List[Tuple[str, str]] = []
+    p = Path(path)
+    if not p.exists():
+        return pairs
+    try:
+        for raw in p.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$", line)
+            if not m:
+                continue
+            key = m.group(1)
+            val = m.group(2)
+            if len(val) >= 2 and ((val[0] == val[-1] == '"') or (val[0] == val[-1] == "'")):
+                val = val[1:-1]
+            pairs.append((key, val))
+    except Exception as e:
+        log.error("Failed to read .env pairs: %s", e)
+    return pairs
 
 
-def _time_until_active_window(now_dt: datetime) -> int:
-    if _within_active_window(now_dt):
-        return 0
-    start_min, _ = _parse_active_window(_ACTIVE_HOURS_LOCAL)
-    for add_days in range(0, 8):
-        candidate = now_dt + timedelta(days=add_days)
-        if candidate.strftime("%a") in _ACTIVE_DAYS:
-            target = candidate.replace(hour=start_min // 60, minute=start_min % 60, second=0, microsecond=0)
-            if target > now_dt:
-                return int((target - now_dt).total_seconds())
-    target = (now_dt + timedelta(days=1)).replace(hour=start_min // 60, minute=start_min % 60, second=0, microsecond=0)
-    return int((target - now_dt).total_seconds())
+def _overlay_env_from_dotenv(path: str) -> None:
+    for k, v in _load_dotenv_pairs(path):
+        if k not in os.environ:
+            os.environ[k] = v
 
 
-def _prune_attempts(now_ts: float, to_number: str) -> None:
+_overlay_env_from_dotenv(".env")
+
+
+DATA_DIR = Path("data")
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+# Legacy CSV history path (compatibility)
+HISTORY_CSV_PATH = DATA_DIR / "call_history.csv"
+
+@dataclass
+class RuntimeConfig:
+    to_number: str = ""
+    from_number: str = ""
+    from_numbers: List[str] = field(default_factory=list)
+
+    active_hours_local: str = "09:00-18:00"
+    active_days: List[str] = field(default_factory=lambda: ["Mon", "Tue", "Wed", "Thu", "Fri"])
+    min_interval_seconds: int = 120
+    max_interval_seconds: int = 420
+    hourly_max_attempts: int = 3
+    daily_max_attempts: int = 20
+
+    admin_user: Optional[str] = None
+    admin_password_hash: Optional[str] = None
+
+    tts_voice: str = "man"
+    tts_language: str = "en-US"
+    # Additional TTS controls
+    tts_rate_percent: int = 100       # 50..200
+    tts_pitch_semitones: int = 0      # -12..+12
+    tts_volume_db: int = 0            # -6..+6
+
+    # Timing controls
+    greeting_pause_seconds: float = 1.0           # pause between greeting lines
+    response_pause_seconds: float = 0.5           # pause before assistant responds
+    between_phrases_pause_seconds: float = 1.0    # pause between multi-part phrases
+
+    max_dialog_turns: int = 6
+    rotate_prompts: bool = True
+    rotate_prompts_strategy: str = "random"
+
+    company_name: str = ""
+    topic: str = ""
+
+    callee_silence_hangup_seconds: int = 8
+
+    recording_mode: str = "off"
+    recording_jurisdiction_mode: str = "disable_in_two_party"
+
+    public_base_url: Optional[str] = None
+    use_ngrok: bool = False
+    enable_media_streams: bool = False
+    stream_outbound_audio: bool = False  # New: whether to stream outbound audio to caller
+    use_hypercorn: bool = False  # New: whether to use Hypercorn ASGI server for WebSocket support
+
+    flask_host: str = "0.0.0.0"
+    flask_port: int = 8080
+    flask_debug: bool = False
+
+    twilio_http_timeout_seconds: int = 10  # network call timeout
+
+
+_runtime = RuntimeConfig()
+
+
+def _normalize_day_name(s: str) -> Optional[str]:
+    if not s:
+        return None
+    t = s.strip().lower()
+    mapping = {
+        "mon": "Mon",
+        "monday": "Mon",
+        "tue": "Tue",
+        "tues": "Tue",
+        "tuesday": "Tue",
+        "wed": "Wed",
+        "weds": "Wed",
+        "wednesday": "Wed",
+        "thu": "Thu",
+        "thur": "Thu",
+        "thurs": "Thu",
+        "thursday": "Thu",
+        "fri": "Fri",
+        "friday": "Fri",
+        "sat": "Sat",
+        "saturday": "Sat",
+        "sun": "Sun",
+        "sunday": "Sun",
+    }
+    return mapping.get(t)
+
+
+def _load_runtime_from_env() -> None:
+    _runtime.to_number = (os.environ.get("TO_NUMBER") or "").strip()
+    _runtime.from_number = (os.environ.get("FROM_NUMBER") or "").strip()
+    _runtime.from_numbers = _parse_csv(os.environ.get("FROM_NUMBERS"))
+
+    _runtime.active_hours_local = (os.environ.get("ACTIVE_HOURS_LOCAL") or "09:00-18:00").strip()
+    days = _parse_csv(os.environ.get("ACTIVE_DAYS") or "Mon,Tue,Wed,Thu,Fri")
+    _runtime.active_days = [d for d in ([_normalize_day_name(x) for x in days]) if d]
+
+    _runtime.min_interval_seconds = max(30, _parse_int(os.environ.get("MIN_INTERVAL_SECONDS"), 120))
+    _runtime.max_interval_seconds = max(_runtime.min_interval_seconds, _parse_int(os.environ.get("MAX_INTERVAL_SECONDS"), 420))
+    _runtime.hourly_max_attempts = max(1, _parse_int(os.environ.get("HOURLY_MAX_ATTEMPTS_PER_DEST"), 3))
+    _runtime.daily_max_attempts = max(_runtime.hourly_max_attempts, _parse_int(os.environ.get("DAILY_MAX_ATTEMPTS_PER_DEST"), 20))
+
+    _runtime.rotate_prompts = _parse_bool(os.environ.get("ROTATE_PROMPTS"), True)
+    _runtime.rotate_prompts_strategy = (os.environ.get("ROTATE_PROMPTS_STRATEGY") or "random").strip().lower()
+
+    _runtime.tts_voice = (os.environ.get("TTS_VOICE") or "man").strip()
+    _runtime.tts_language = (os.environ.get("TTS_LANGUAGE") or "en-US").strip()
+    _runtime.tts_rate_percent = max(50, min(200, _parse_int(os.environ.get("TTS_RATE_PERCENT"), 100)))
+    _runtime.tts_pitch_semitones = max(-12, min(12, _parse_int(os.environ.get("TTS_PITCH_SEMITONES"), 0)))
+    _runtime.tts_volume_db = max(-6, min(6, _parse_int(os.environ.get("TTS_VOLUME_DB"), 0)))
+
+    def _parse_float_env(name: str, default: float, lo: float, hi: float) -> float:
+        try:
+            v = float(str(os.environ.get(name, "")).strip())
+        except Exception:
+            v = default
+        v = max(lo, min(hi, v))
+        return round(v, 2)
+
+    _runtime.greeting_pause_seconds = _parse_float_env("GREETING_PAUSE_SECONDS", 1.0, 0.0, 5.0)
+    _runtime.response_pause_seconds = _parse_float_env("RESPONSE_PAUSE_SECONDS", 0.5, 0.0, 5.0)
+    _runtime.between_phrases_pause_seconds = _parse_float_env("BETWEEN_PHRASES_PAUSE_SECONDS", 1.0, 0.0, 5.0)
+
+    _runtime.max_dialog_turns = max(0, _parse_int(os.environ.get("MAX_DIALOG_TURNS"), 6))
+
+    _runtime.recording_mode = (os.environ.get("RECORDING_MODE") or "off").strip().lower()
+    _runtime.recording_jurisdiction_mode = (os.environ.get("RECORDING_JURISDICTION_MODE") or "disable_in_two_party").strip().lower()
+
+    _runtime.company_name = (os.environ.get("COMPANY_NAME") or "").strip()
+    _runtime.topic = (os.environ.get("TOPIC") or "").strip()
+
+    _runtime.callee_silence_hangup_seconds = max(3, min(60, _parse_int(os.environ.get("CALLEE_SILENCE_HANGUP_SECONDS"), 8)))
+
+    _runtime.public_base_url = (os.environ.get("PUBLIC_BASE_URL") or "").strip() or None
+    _runtime.use_ngrok = _parse_bool(os.environ.get("USE_NGROK"), False)
+    _runtime.enable_media_streams = _parse_bool(os.environ.get("ENABLE_MEDIA_STREAMS"), False)
+    _runtime.stream_outbound_audio = _parse_bool(os.environ.get("STREAM_OUTBOUND_AUDIO"), False)
+    _runtime.use_hypercorn = _parse_bool(os.environ.get("USE_HYPERCORN"), False)
+
+    _runtime.flask_host = (os.environ.get("FLASK_HOST") or "0.0.0.0").strip() or "0.0.0.0"
+    _runtime.flask_port = _parse_int(os.environ.get("FLASK_PORT"), 8080)
+    _runtime.flask_debug = _parse_bool(os.environ.get("FLASK_DEBUG"), False)
+
+    _runtime.twilio_http_timeout_seconds = max(3, _parse_int(os.environ.get("TWILIO_HTTP_TIMEOUT_SECONDS"), 10))
+
+
+_load_runtime_from_env()
+
+_EDITABLE_ENV_KEYS = [
+    "TO_NUMBER",
+    "FROM_NUMBER",
+    "FROM_NUMBERS",
+    "ACTIVE_HOURS_LOCAL",
+    "ACTIVE_DAYS",
+    "MIN_INTERVAL_SECONDS",
+    "MAX_INTERVAL_SECONDS",
+    "HOURLY_MAX_ATTEMPTS_PER_DEST",
+    "DAILY_MAX_ATTEMPTS_PER_DEST",
+    "RECORDING_MODE",
+    "RECORDING_JURISDICTION_MODE",
+    "TTS_VOICE",
+    "TTS_LANGUAGE",
+    "TTS_RATE_PERCENT",
+    "TTS_PITCH_SEMITONES",
+    "TTS_VOLUME_DB",
+    "GREETING_PAUSE_SECONDS",
+    "RESPONSE_PAUSE_SECONDS",
+    "BETWEEN_PHRASES_PAUSE_SECONDS",
+    "MAX_DIALOG_TURNS",
+    "ROTATE_PROMPTS",
+    "ROTATE_PROMPTS_STRATEGY",
+    "COMPANY_NAME",
+    "TOPIC",
+    "ALLOWED_COUNTRY_CODES",
+    "CALLEE_SILENCE_HANGUP_SECONDS",
+    "USE_NGROK",
+    "ENABLE_MEDIA_STREAMS",
+    "STREAM_OUTBOUND_AUDIO",  # New: toggle outbound media streaming
+    "USE_HYPERCORN",          # New: toggle Hypercorn server
+    "NONINTERACTIVE",
+    "LOG_COLOR",
+    "FLASK_HOST",
+    "FLASK_PORT",
+    "FLASK_DEBUG",
+    "PUBLIC_BASE_URL",
+    "DIRECT_DIAL_ON_TRIGGER",
+    "TWILIO_HTTP_TIMEOUT_SECONDS",
+]
+
+_SECRET_ENV_KEYS = {
+    "TWILIO_ACCOUNT_SID",
+    "TWILIO_AUTH_TOKEN",
+    "ADMIN_PASSWORD_HASH",
+    "ADMIN_USER",
+    "FLASK_SECRET",
+}
+
+
+def _current_env_editable_pairs() -> List[Tuple[str, str]]:
+    effective: Dict[str, str] = {}
+    for k in _EDITABLE_ENV_KEYS:
+        effective[k] = (os.environ.get(k) or "").strip()
+    try:
+        env_path = Path(".env")
+        if env_path.exists():
+            for k, v in _load_dotenv_pairs(str(env_path)):
+                if k in _EDITABLE_ENV_KEYS:
+                    effective[k] = (v or "").strip()
+    except Exception:
+        pass
+    return [(k, effective.get(k, "")) for k in _EDITABLE_ENV_KEYS]
+
+
+def _load_dotenv_for_write() -> List[str]:
+    p = Path(".env")
+    if not p.exists():
+        return []
+    try:
+        with p.open("r", encoding="utf-8") as f:
+            return f.readlines()
+    except Exception:
+        return []
+
+
+def _write_env_updates_preserving_comments(updates: Dict[str, str]) -> None:
+    env_path = Path(".env")
+    try:
+        lines = _load_dotenv_for_write()
+        key_to_idx: Dict[str, int] = {}
+        for idx, raw in enumerate(lines):
+            s = raw.strip()
+            if not s or s.startswith("#"):
+                continue
+            eq = s.find("=")
+            if eq <= 0:
+                continue
+            k = s[:eq].strip()
+            if k in _EDITABLE_ENV_KEYS:
+                key_to_idx[k] = idx
+        content = list(lines)
+        for k, v in updates.items():
+            if k not in _EDITABLE_ENV_KEYS:
+                continue
+            safe_v = "" if v is None else str(v)
+            new_line = f"{k}={safe_v}\n"
+            if k in key_to_idx:
+                content[key_to_idx[k]] = new_line
+            else:
+                if content and not content[-1].endswith("\n"):
+                    content[-1] = content[-1] + "\n"
+                content.append(new_line)
+        tmp = env_path.with_suffix(".tmp")
+        bak = env_path.with_suffix(".bak")
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.writelines(content)
+            f.flush()
+        try:
+            if env_path.exists():
+                if bak.exists():
+                    try:
+                        bak.unlink()
+                    except Exception:
+                        pass
+                env_path.replace(bak)
+        except Exception:
+            pass
+        os.replace(tmp, env_path)
+        log.info("Wrote .env updates for keys: %s", ", ".join(sorted(updates.keys())))
+    except Exception as e:
+        log.error("Failed writing .env: %s", e)
+
+
+def _apply_env_updates(updates: Dict[str, str]) -> None:
+    log.info("Applying env updates: %s", {k: ("<redacted>" if k in _SECRET_ENV_KEYS else updates[k]) for k in updates})
+    _write_env_updates_preserving_comments(updates)
+    for k, v in updates.items():
+        if k in _EDITABLE_ENV_KEYS and k not in _SECRET_ENV_KEYS:
+            os.environ[k] = "" if v is None else str(v)
+    _load_runtime_from_env()
+    _log_runtime_summary(context="after env update")
+
+
+def _reload_runtime_after_env_update() -> None:
+    """
+    Reload critical runtime settings that may have changed via admin panel,
+    logging any changes for easier debugging. This lets you toggle media streams
+    and other key settings without a full server restart (pretty handy!).
+    """
+    # Store previous values for comparison
+    prev_enable_media = _runtime.enable_media_streams
+    prev_stream_outbound = _runtime.stream_outbound_audio
+    prev_public_url = _runtime.public_base_url
+    
+    # Re-read the specific flags we care about
+    _runtime.enable_media_streams = _parse_bool(os.environ.get("ENABLE_MEDIA_STREAMS"), False)
+    _runtime.stream_outbound_audio = _parse_bool(os.environ.get("STREAM_OUTBOUND_AUDIO"), False)
+    _runtime.public_base_url = (os.environ.get("PUBLIC_BASE_URL") or "").strip() or None
+    
+    # Log what actually changed (helps with debugging)
+    changes = []
+    if prev_enable_media != _runtime.enable_media_streams:
+        changes.append(f"ENABLE_MEDIA_STREAMS: {prev_enable_media} -> {_runtime.enable_media_streams}")
+    if prev_stream_outbound != _runtime.stream_outbound_audio:
+        changes.append(f"STREAM_OUTBOUND_AUDIO: {prev_stream_outbound} -> {_runtime.stream_outbound_audio}")
+    if prev_public_url != _runtime.public_base_url:
+        changes.append(f"PUBLIC_BASE_URL: {prev_public_url or '(none)'} -> {_runtime.public_base_url or '(none)'}")
+    
+    if changes:
+        log.info("Runtime settings reloaded, changes: %s", "; ".join(changes))
+    else:
+        log.debug("Runtime settings reloaded, no changes detected")
+
+
+# Attempt pacing
+_attempts_lock = threading.Lock()
+_dest_attempts: Dict[str, List[float]] = {}
+_next_call_epoch_s_lock = threading.Lock()
+_next_call_epoch_s: Optional[int] = None
+_interval_start_epoch_s: Optional[int] = None
+_interval_total_seconds: Optional[int] = None
+
+
+def _prune_attempts(now_ts: int, to_number: str) -> None:
     with _attempts_lock:
         lst = _dest_attempts.get(to_number, [])
-        one_day_ago = now_ts - 86400
-        _dest_attempts[to_number] = [t for t in lst if t >= one_day_ago]
+        cutoff = now_ts - 24 * 3600
+        _dest_attempts[to_number] = [t for t in lst if t >= cutoff]
 
 
-def _can_attempt(now_ts: float, to_number: str) -> Tuple[bool, int]:
+def _note_attempt(now_ts: float, to_number: str) -> None:
+    with _attempts_lock:
+        _dest_attempts.setdefault(to_number, []).append(now_ts)
+    log.info("Noted attempt at %s for %s", int(now_ts), _mask_phone(to_number))
+
+
+def _within_active_window(now_local: datetime) -> bool:
+    try:
+        start_str, end_str = (_runtime.active_hours_local or "09:00-18:00").split("-", 1)
+        sh, sm = [int(x) for x in start_str.split(":")]
+        eh, em = [int(x) for x in end_str.split(":")]
+    except Exception:
+        sh, sm, eh, em = 9, 0, 18, 0
+    wd_map = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    today = wd_map[now_local.weekday()]
+    if _runtime.active_days and today not in _runtime.active_days:
+        return False
+    t_minutes = now_local.hour * 60 + now_local.minute
+    start_m = sh * 60 + sm
+    end_m = eh * 60 + em
+    if start_m <= end_m:
+        return start_m <= t_minutes <= end_m
+    return t_minutes >= start_m or t_minutes <= end_m
+
+
+def _can_attempt(now_ts: int, to_number: str) -> Tuple[bool, int]:
     _prune_attempts(now_ts, to_number)
     with _attempts_lock:
         lst = _dest_attempts.get(to_number, [])
         last_hour = [t for t in lst if t >= now_ts - 3600]
-        last_day = lst
-        hourly_ok = len(last_hour) < _HOURLY_MAX_PER_DEST
-        daily_ok = len(last_day) < _DAILY_MAX_PER_DEST
-        wait_hour = 0
-        wait_day = 0
-        if not hourly_ok and last_hour:
-            next_allowed_hour = min(last_hour) + 3600
-            wait_hour = max(0, int(next_allowed_hour - now_ts))
-        if not daily_ok and last_day:
-            next_allowed_day = min(last_day) + 86400
-            wait_day = max(0, int(next_allowed_day - now_ts))
-    with _attempts_lock:
-        bo = _dest_backoff.get(to_number)
-        wait_bo = 0
-        if bo and bo.get("next_earliest_ts"):
-            wait_bo = max(0, int(bo["next_earliest_ts"] - now_ts))
-    wait_total = max(wait_hour, wait_day, wait_bo)
-    return hourly_ok and daily_ok and wait_bo == 0, wait_total
+        if len(last_hour) >= _runtime.hourly_max_attempts:
+            oldest = min(last_hour) if last_hour else now_ts
+            wait = max(1, (int(oldest) + 3600) - now_ts)
+            log.info("Attempt blocked by hourly cap: %s/%s, wait %ss", len(last_hour), _runtime.hourly_max_attempts, wait)
+            return False, wait
+        if len(lst) >= _runtime.daily_max_attempts:
+            log.info("Attempt blocked by daily cap: %s/%s", len(lst), _runtime.daily_max_attempts)
+            return False, 3600
+    return True, 0
 
 
-def _update_backoff(to_number: str, outcome: str) -> None:
-    immediate_fail = outcome in {
-        "Busy",
-        "Declined/Blocked",
-        "No answer",
-        "Voicemail detected",
-        "No answer; voicemail after ringing",
-        "Voicemail or immediate forward",
-        "Completed with zero duration",
-    }
-    with _attempts_lock:
-        state = _dest_backoff.setdefault(to_number, {"fail_count": 0, "next_earliest_ts": 0.0})
-        if _BACKOFF_STRATEGY == "none":
-            state["fail_count"] = 0
-            state["next_earliest_ts"] = 0.0
-            return
-        if immediate_fail:
-            state["fail_count"] = int(state.get("fail_count", 0)) + 1
-        else:
-            state["fail_count"] = 0
-            state["next_earliest_ts"] = 0.0
-            return
-        base_delay = _MIN_INTERVAL_S
-        delay = base_delay * state["fail_count"] if _BACKOFF_STRATEGY == "linear" else base_delay * (2 ** (state["fail_count"] - 1))
-        max_delay = 3600
-        delay = min(delay, max_delay)
-        state["next_earliest_ts"] = time.time() + delay
+def _compute_next_interval_seconds() -> int:
+    lo = max(30, int(_runtime.min_interval_seconds))
+    hi = max(lo, int(_runtime.max_interval_seconds))
+    if lo == hi:
+        return lo
+    return random.randint(lo, hi)
 
 
-def normalize_to_e164(number: str) -> str:
-    if not number:
-        raise ValueError("Empty phone number.")
-    n = re.sub(r"[^\d+]", "", number.strip())
-    if n.startswith("+"):
-        if re.fullmatch(r"\+\d{8,15}", n):
-            return n
-        raise ValueError(f"Invalid E.164 format: {number}")
-    if re.fullmatch(r"1\d{10}", n):
-        return f"+{n}"
-    if re.fullmatch(r"\d{10}", n):
-        return f"+1{n}"
-    raise ValueError(f"Cannot normalize number to E.164: {number}")
+# Twilio client
+_twilio_client: Optional[Client] = None
 
 
-def parse_allowed_country_codes(env_val: Optional[str]) -> Set[str]:
-    default = {"+1"}
-    if not env_val:
-        return default
-    codes: Set[str] = set()
-    for part in env_val.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        if not re.fullmatch(r"\+\d{1,3}", part):
-            raise ValueError(f"Invalid country code: {part}")
-        codes.add(part)
-    return codes or default
-
-
-def enforce_country_allowlist(e164_number: str, allowed: Set[str]) -> None:
-    if not re.fullmatch(r"\+\d{8,15}", e164_number):
-        raise ValueError(f"Not a valid E.164 number: {e164_number}")
-    if not any(e164_number.startswith(code) for code in allowed):
-        allowed_str = ", ".join(sorted(allowed))
-        raise ValueError(f"Destination number not in allowlist. Allowed: {allowed_str}.")
-
-
-def _load_from_numbers() -> None:
-    global _FROM_NUMBERS
-    csv_str = os.getenv("FROM_NUMBERS", "").strip()
-    if csv_str:
-        nums = [normalize_to_e164(p) for p in csv_str.split(",") if p.strip()]
-        _FROM_NUMBERS = nums
-
-
-def _select_from_number_random() -> str:
+def _ensure_twilio_client() -> Optional[Client]:
     """
-    Always choose a random FROM number if a pool is provided; otherwise use FROM_NUMBER.
-    Cooldowns and 'prefer local' are intentionally ignored to meet the requirement.
+    Build the Twilio REST client with a bounded HTTP timeout to avoid
+    indefinite hangs on network issues.
     """
-    if _FROM_NUMBERS:
-        return random.choice(_FROM_NUMBERS)
-    return os.getenv("FROM_NUMBER", "")
+    global _twilio_client
+    if _twilio_client is not None:
+        return _twilio_client
+    if Client is None:
+        log.error("Twilio SDK not available. Install with: pip install twilio")
+        return None
+    sid = os.environ.get("TWILIO_ACCOUNT_SID")
+    tok = os.environ.get("TWILIO_AUTH_TOKEN")
+    if not sid or not tok:
+        log.error("Missing TWILIO_ACCOUNT_SID or TWILIO_AUTH_TOKEN in environment.")
+        return None
 
-
-def start_flask_server(listen_host: str, listen_port: int) -> None:
-    # Flask dev server supports websockets via flask-sock/simple-websocket
-    app.run(host=listen_host, port=listen_port, debug=False, use_reloader=False)
-
-
-def ensure_public_base_url() -> Tuple[str, Optional[threading.Thread]]:
-    global _PUBLIC_BASE_URL
-    listen_host = os.getenv("LISTEN_HOST", "0.0.0.0")
-    listen_port = int(os.getenv("LISTEN_PORT", "5005"))
-    public_base_url = os.getenv("PUBLIC_BASE_URL", None)
-    use_ngrok = os.getenv("USE_NGROK", "false").strip().lower() in {"1", "true", "yes", "on"}
-
-    server_thread = threading.Thread(target=start_flask_server, args=(listen_host, listen_port), daemon=True)
-    server_thread.start()
-
-    if public_base_url:
-        public_base_url = public_base_url.rstrip("/")
-        _PUBLIC_BASE_URL = public_base_url
-        logging.info("Using PUBLIC_BASE_URL: %s", public_base_url)
-        return public_base_url, server_thread
-
-    if use_ngrok:
-        if not _HAS_NGROK:
-            raise RuntimeError("USE_NGROK=true but pyngrok is not installed. pip install pyngrok")
-        authtoken = os.getenv("NGROK_AUTHTOKEN", None)
-        ngrok_path = os.environ.get("NGROK_PATH", "")
-        pyngrok_config = PyngrokConfig(ngrok_path=ngrok_path) if ngrok_path else None
-        if authtoken:
-            ngrok_conf.get_default().auth_token = authtoken
-        http_tunnel = ngrok.connect(addr=listen_port, proto="http", bind_tls=True, pyngrok_config=pyngrok_config)
-        public_url = http_tunnel.public_url.rstrip("/")
-        _PUBLIC_BASE_URL = public_url
-        logging.info("ngrok tunnel established: %s -> http://%s:%s", public_url, listen_host, listen_port)
-        return public_url, server_thread
-
-    raise RuntimeError("No PUBLIC_BASE_URL set and USE_NGROK is not enabled.")
-
-
-def place_call(client: Client, url: str, from_number: str, to_number: str, interval_chosen_s: int, backoff_wait_s: int) -> str:
-    create_kwargs: Dict[str, Any] = {
-        "to": to_number,
-        "from_": from_number,
-        "url": url,
-        "method": "POST",
-        "status_callback": url.replace("/voice", "/status"),
-        "status_callback_method": "POST",
-        "status_callback_event": ["initiated", "ringing", "answered", "completed"],
-    }
-    if _ENABLE_AMD:
-        create_kwargs["machine_detection"] = _AMD_MODE
-        create_kwargs["machine_detection_timeout"] = _AMD_TIMEOUT_S
-    if _recording_enabled():
-        create_kwargs["record"] = True
-        create_kwargs["recording_channels"] = "dual" if _RECORDING_CHANNELS == "dual" else "mono"
-        create_kwargs["recording_status_callback"] = url.replace("/voice", "/recording-status")
-        create_kwargs["recording_status_callback_method"] = "POST"
-        create_kwargs["recording_status_callback_event"] = _RECORDING_STATUS_EVENTS or ["completed"]
-
-    call = client.calls.create(**create_kwargs)
-    diag = _ensure_diag_state(call.sid)
-    with _diag_lock:
-        diag["from_number"] = from_number
-        diag["interval_chosen_s"] = interval_chosen_s
-        diag["backoff_applied_s"] = backoff_wait_s
-    logging.info("Call initiated. SID=%s To=%s From=%s interval_chosen=%ss backoff_applied=%ss", call.sid, to_number, from_number, interval_chosen_s, backoff_wait_s)
-    return call.sid
-
-
-# ====== Prompt rotation ======
-
-def _format_prompt_text(raw: str) -> str:
-    raw = (raw or "").strip()
-    if not raw:
-        return ""
-    try:
-        return raw.format(topic=_TOPIC, company=_COMPANY_NAME)
-    except Exception:
-        return raw
-
-
-def _default_prompt_text() -> str:
-    return f"Thanks for taking my call. I need help with my car. Could you help with { _TOPIC }?"
-
-
-def _next_prompt() -> str:
-    if not _ROTATE_PROMPTS:
-        return _default_prompt_text()
-    local_list = _prompts_list if _prompts_list else []
-    if not local_list:
-        return _default_prompt_text()
-
-    global _prompt_index, _last_random_index
-    with _prompt_lock:
-        if _ROTATE_PROMPTS_STRATEGY == "random":
-            if len(local_list) == 1:
-                idx = 0
-            else:
-                choices = list(range(len(local_list)))
-                if _last_random_index is not None and _last_random_index in choices and len(choices) > 1:
-                    choices.remove(_last_random_index)
-                idx = random.choice(choices)
-                _last_random_index = idx
-        else:
-            idx = _prompt_index % len(local_list)
-            _prompt_index = (idx + 1) % len(local_list)
-    return _format_prompt_text(local_list[idx])
-
-
-def _assign_prompt_if_needed(call_sid: str) -> str:
-    d = _ensure_diag_state(call_sid)
-    with _diag_lock:
-        if not d.get("prompt"):
-            d["prompt"] = _next_prompt()
-        return d["prompt"]
-
-
-# ====== TwiML endpoints ======
-
-@app.route("/voice", methods=["POST"])
-def voice_entrypoint() -> Response:
-    call_sid = request.form.get("CallSid", "")
-    _ensure_call_state(call_sid)
-    _schedule_forced_hangup(call_sid, seconds=_MAX_CALL_DURATION_S)
-
-    # Assign a prompt to this call at the very start
-    assigned_prompt = _assign_prompt_if_needed(call_sid)
-    logging.info("Prompt selected for CallSid=%s: %s", call_sid, assigned_prompt or "<empty>")
-
-    xml = (
-        "<Response>"
-        f"<Gather input='speech' method='POST' action='/wait_for_callee?cycle=1' "
-        f"timeout='{max(1, min(10, _GREETING_WAIT_TIMEOUT_S))}' "
-        f"speechTimeout='auto' language='{_escape_xml(_TTS_LANGUAGE)}' "
-        f"actionOnEmptyResult='true' "
-        f"partialResultCallback='/transcribe-partial?stage=hello&amp;seq=1' "
-        f"partialResultCallbackMethod='POST'/>"
-        "</Response>"
-    )
-    return twiml_response(xml)
-
-
-@app.route("/wait_for_callee", methods=["POST"])
-def wait_for_callee_handler() -> Response:
-    call_sid = request.form.get("CallSid", "")
-    speech_text = request.form.get("SpeechResult", "") or ""
-    cycle = int(request.args.get("cycle", "1") or "1")
-
-    # Include Media Stream start only once (on first cycle) to avoid duplicates.
-    # Stream inbound (callee) audio to our WebSocket endpoint.
-    wss_base = ""
-    if _PUBLIC_BASE_URL:
-        wss_base = _PUBLIC_BASE_URL.replace("https://", "wss://").replace("http://", "ws://")
-    stream_start = ""
-    if cycle == 1 and wss_base:
-        stream_start = f"<Start><Stream url='{_escape_xml(wss_base + '/media-stream')}' track='inbound_track' /></Start>"
-
-    if speech_text:
-        _append_callee_line(call_sid, speech_text)
-    else:
-        if cycle < _GREETING_MAX_CYCLES:
-            next_cycle = cycle + 1
-            xml = (
-                "<Response>"
-                f"{stream_start}"
-                f"<Gather input='speech' method='POST' action='/wait_for_callee?cycle={next_cycle}' "
-                f"timeout='{max(1, min(10, _GREETING_WAIT_TIMEOUT_S))}' "
-                f"speechTimeout='auto' language='{_escape_xml(_TTS_LANGUAGE)}' "
-                f"actionOnEmptyResult='true' "
-                f"partialResultCallback='/transcribe-partial?stage=hello&amp;seq={next_cycle}' "
-                f"partialResultCallbackMethod='POST'/>"
-                "</Response>"
-            )
-            return twiml_response(xml)
-
-    with _call_state_lock:
-        st = _call_state.get(call_sid)
-        if st:
-            st["fsm_state"] = "GREET_AND_PROMPT"
-
-    # Compose initial lines: greeting + optional consent + rotating prompt.
-    prompt_line = _assign_prompt_if_needed(call_sid) or _default_prompt_text()
-    lines = []
-    lines.append(f"Hello. This is an automated assistant from {_COMPANY_NAME}.")
-    if _recording_enabled():
-        lines.append("With your consent, this call may be recorded for quality and support.")
-    lines.append(prompt_line)
-    for ln in lines:
-        _append_assistant_line(call_sid, ln)
-
-    say_voice = _escape_xml(_TTS_VOICE)
-    say_lang = _escape_xml(_TTS_LANGUAGE)
-    parts: List[str] = ["<Response>"]
-    if stream_start:
-        parts.append(stream_start)
-    parts.append(
-        f"<Gather input='speech' method='POST' action='/transcribe?seq=1' "
-        f"timeout='{_CALLEE_SILENCE_HANGUP_S}' speechTimeout='auto' language='{say_lang}' actionOnEmptyResult='true' "
-        f"bargeIn='true' partialResultCallback='/transcribe-partial?stage=dialog&amp;seq=1' "
-        f"partialResultCallbackMethod='POST'>"
-    )
-    for ln in lines:
-        parts.append(f"<Say voice='{say_voice}' language='{say_lang}'>{_escape_xml(ln)}</Say>")
-        parts.append("<Pause length='0.4'/>")
-    parts.append("</Gather>")
-    parts.append("</Response>")
-    with _call_state_lock:
-        st = _call_state.get(call_sid)
-        if st:
-            st["fsm_state"] = "DIALOG"
-    return twiml_response("".join(parts))
-
-
-@app.route("/transcribe-partial", methods=["POST"])
-def transcribe_partial_handler() -> Response:
-    call_sid = request.form.get("CallSid", "")
-    partial = request.form.get("UnstableSpeechResult") or request.form.get("SpeechResult") or ""
-    if partial:
-        _append_partial_callee(call_sid, partial)
-        _buffer_partial(call_sid, partial, inactivity_ms=1000)
-    return Response("", status=204)
-
-
-@app.route("/transcribe", methods=["POST"])
-def transcribe_handler() -> Response:
-    call_sid = request.form.get("CallSid", "")
-    speech_text = request.form.get("SpeechResult", "") or ""
-    seq = int(request.args.get("seq", "1") or "1")
-
-    if speech_text:
-        _clear_live_utterance(call_sid)
-        _append_callee_line(call_sid, speech_text)
-
-        with _call_state_lock:
-            st = _call_state.get(call_sid)
-            context = st["context"] if st else {}
-
-        next_lines, should_end = _next_assistant_turn(context, speech_text)
-        if should_end:
-            say_voice = _escape_xml(_TTS_VOICE)
-            say_lang = _escape_xml(_TTS_LANGUAGE)
-            line = (next_lines or ["Understood. Thank you."])[0]
-            _append_assistant_line(call_sid, line)
-            xml = f"<Response><Say voice='{say_voice}' language='{say_lang}'>{_escape_xml(line)}</Say><Hangup/></Response>"
-            with _call_state_lock:
-                st2 = _call_state.get(call_sid)
-                if st2:
-                    st2["fsm_state"] = "ENDING"
-            return twiml_response(xml)
-
-        next_seq = seq + 1
-        if next_lines:
-            for ln in next_lines:
-                _append_assistant_line(call_sid, ln)
-            say_voice = _escape_xml(_TTS_VOICE)
-            say_lang = _escape_xml(_TTS_LANGUAGE)
-            parts: List[str] = ["<Response>"]
-            parts.append(
-                f"<Gather input='speech' method='POST' action='/transcribe?seq={next_seq}' "
-                f"timeout='{_CALLEE_SILENCE_HANGUP_S}' speechTimeout='auto' language='{say_lang}' actionOnEmptyResult='true' "
-                f"bargeIn='true' partialResultCallback='/transcribe-partial?stage=dialog&amp;seq={next_seq}' "
-                f"partialResultCallbackMethod='POST'>"
-            )
-            for ln in next_lines:
-                parts.append(f"<Say voice='{say_voice}' language='{say_lang}'>{_escape_xml(ln)}</Say>")
-                parts.append("<Pause length='0.4'/>")
-            parts.append("</Gather>")
-            parts.append("</Response>")
-            return twiml_response("".join(parts))
-        else:
-            say_lang = _escape_xml(_TTS_LANGUAGE)
-            xml = (
-                "<Response>"
-                f"<Gather input='speech' method='POST' action='/transcribe?seq={next_seq}' "
-                f"timeout='{_CALLEE_SILENCE_HANGUP_S}' speechTimeout='auto' language='{say_lang}' "
-                f"actionOnEmptyResult='true' bargeIn='true' "
-                f"partialResultCallback='/transcribe-partial?stage=dialog&amp;seq={next_seq}' "
-                f"partialResultCallbackMethod='POST'/>"
-                "</Response>"
-            )
-            return twiml_response(xml)
-
-    with _call_state_lock:
-        st = _call_state.get(call_sid)
-        if st:
-            st["fsm_state"] = "ENDING"
-    return twiml_response("<Response><Hangup/></Response>")
-
-
-def _next_assistant_turn(context: Dict[str, Any], user_text: str) -> Tuple[Optional[List[str]], bool]:
-    t = (user_text or "").lower()
-    if any(k in t for k in ["do not call", "remove me", "stop calling", "unsubscribe", "no more calls", "wrong number"]):
-        return (["Understood. We will not call again. Thank you for your time."], True)
-
-    if not (context.get("year") and context.get("make") and context.get("model")):
-        return (["Could you share the year, make, and model?"], False)
-    if not context.get("engine"):
-        return (["Do you know the engine size or the 8th digit of the VIN?"], False)
-    if not context.get("location"):
-        return (["What is your location for logistics?"], False)
-    if not context.get("budget"):
-        return (["What budget range should we consider for parts and labor?"], False)
-    return (["If that works, what is the next step to move forward?"], False)
-
-
-# ====== Live audio WebSockets ======
-
-@sock.route("/media-stream")
-def media_stream(ws):
-    """
-    Twilio connects here (wss) and sends JSON events:
-    - {"event":"start", ...}
-    - {"event":"media", "media":{"payload": "<base64 mu-law 8k audio>"}}
-    - {"event":"stop"}
-    We rebroadcast 'media' payload to all connected browser listeners.
-    """
-    call_sid = None
-    try:
-        while True:
-            msg = ws.receive()
-            if msg is None:
-                break
-            try:
-                data = json.loads(msg)
-            except Exception:
-                continue
-            ev = (data.get("event") or "").lower()
-            if ev == "start":
-                start = data.get("start", {})
-                call_sid = start.get("callSid") or start.get("streamSid")
-                logging.info("Media stream started: %s", call_sid or "<unknown>")
-            elif ev == "media":
-                media = data.get("media", {})
-                payload = media.get("payload")
-                if payload:
-                    # Broadcast only the audio payload; browser JS decodes and plays.
-                    out = json.dumps({"type": "media", "payload": payload})
-                    with _audio_clients_lock:
-                        dead = []
-                        for cli in _audio_clients:
-                            try:
-                                cli.send(out)
-                            except Exception:
-                                dead.append(cli)
-                        for cli in dead:
-                            _audio_clients.discard(cli)
-            elif ev == "stop":
-                logging.info("Media stream stopped: %s", call_sid or "<unknown>")
-                break
-    except Exception as e:
-        logging.error("Media stream error: %s", str(e))
-    finally:
+    http_client = None
+    if TwilioHttpClient is not None:
         try:
-            ws.close()
-        except Exception:
-            pass
+            http_client = TwilioHttpClient(timeout=_runtime.twilio_http_timeout_seconds)
+            log.info("Twilio HTTP client configured with timeout=%ss.", _runtime.twilio_http_timeout_seconds)
+        except Exception as e:
+            http_client = None
+            log.warning("Failed to configure TwilioHttpClient timeout: %s", e)
+
+    _twilio_client = Client(sid, tok, http_client=http_client) if http_client else Client(sid, tok)
+    log.info("Twilio client initialized (account SID present).")
+    return _twilio_client
 
 
-@sock.route("/ws/live-audio")
-def ws_live_audio(ws):
+def _choose_from_number() -> Optional[str]:
+    if _runtime.from_numbers:
+        return random.choice(_runtime.from_numbers)
+    return _runtime.from_number or None
+
+
+# Background dialer and state
+_manual_call_requested = threading.Event()
+_stop_requested = threading.Event()
+_dialer_thread = None  # started in main()
+
+# Track active and pending (pre-callback) call states
+_CURRENT_CALL_LOCK = threading.Lock()
+_CURRENT_CALL_SID: Optional[str] = None
+
+# Pending is used to block duplicate placements between calls.create and Twilio callbacks
+_PENDING_LOCK = threading.Lock()
+_PENDING_UNTIL_TS: Optional[float] = None
+_PENDING_TTL_SECONDS = 30.0  # short TTL during diagnostics
+
+# Track last placement error to surface to UI
+_LAST_DIAL_ERROR_LOCK = threading.Lock()
+_LAST_DIAL_ERROR: Optional[Dict[str, Any]] = None
+
+
+def _set_last_dial_error(message: str) -> None:
+    global _LAST_DIAL_ERROR
+    with _LAST_DIAL_ERROR_LOCK:
+        _LAST_DIAL_ERROR = {"ts": int(time.time()), "message": message or "unknown error"}
+    log.error("Call placement error: %s", message)
+
+
+def _clear_last_dial_error() -> None:
+    global _LAST_DIAL_ERROR
+    with _LAST_DIAL_ERROR_LOCK:
+        _LAST_DIAL_ERROR = None
+
+
+def _set_current_call_sid(sid: Optional[str]) -> None:
+    global _CURRENT_CALL_SID
+    with _CURRENT_CALL_LOCK:
+        _CURRENT_CALL_SID = sid
+    log.info("Set current call SID to %s", _mask_sid(sid))
+
+
+def _get_current_call_sid() -> Optional[str]:
+    with _CURRENT_CALL_LOCK:
+        return _CURRENT_CALL_SID
+
+
+def _mark_outgoing_pending() -> None:
+    global _PENDING_UNTIL_TS
+    with _PENDING_LOCK:
+        _PENDING_UNTIL_TS = time.time() + _PENDING_TTL_SECONDS
+    log.info("Marked outgoing call as pending for %.0fs", _PENDING_TTL_SECONDS)
+
+
+def _clear_outgoing_pending() -> None:
+    global _PENDING_UNTIL_TS
+    with _PENDING_LOCK:
+        _PENDING_UNTIL_TS = None
+    log.info("Cleared outgoing pending flag.")
+
+
+def _is_outgoing_pending() -> bool:
+    global _PENDING_UNTIL_TS
+    with _PENDING_LOCK:
+        if _PENDING_UNTIL_TS is None:
+            return False
+        if time.time() >= _PENDING_UNTIL_TS:
+            _PENDING_UNTIL_TS = None
+            log.info("Pending flag expired.")
+            return False
+        return True
+
+
+# Dialog rotation and per-call parameters
+@dataclass
+class CallParams:
+    voice: str
+    dialog_idx: int
+
+
+# Dialog sets (2-line seed; follow-ups come from rotating_iv_prompts when available).
+_DIALOGS: List[List[str]] = [
+    ["Where is my refund?", "I need a straight answer."],
+    ["Let us skip delays.", "Please be direct."],
+    ["I expect clarity.", "Provide specifics now."],
+    ["Avoid generalities.", "Focus on the facts."],
+    ["Please explain the status.", "Outline next steps clearly."],
+    ["Confirm the details.", "Do not omit anything relevant."],
+]
+
+_CALL_PARAMS_BY_SID: Dict[str, CallParams] = {}
+_PENDING_CALL_PARAMS: Optional[CallParams] = None
+_PLACED_CALL_COUNT = 0
+_LAST_DIALOG_IDX = -1
+_PARAMS_LOCK = threading.Lock()
+
+
+def _select_next_call_params_locked() -> CallParams:
     """
-    Browsers connect here to receive live audio frames (JSON with base64 mu-law).
+    Select next call parameters.
+    IMPORTANT: Caller must hold _PARAMS_LOCK.
     """
-    with _audio_clients_lock:
-        _audio_clients.add(ws)
+    global _PLACED_CALL_COUNT, _LAST_DIALOG_IDX
+    _PLACED_CALL_COUNT += 1
+    voice = "man" if (_PLACED_CALL_COUNT % 2 == 1) else "woman"
+    _LAST_DIALOG_IDX = (_LAST_DIALOG_IDX + 1) % max(1, len(_DIALOGS))
+    cp = CallParams(voice=voice, dialog_idx=_LAST_DIALOG_IDX)
+    log.info("Selected call params: voice=%s, dialog_idx=%s", cp.voice, cp.dialog_idx)
+    return cp
+
+
+def _prepare_params_for_next_call() -> None:
+    """
+    Prepare and store pending call params for the next outbound call.
+    """
+    global _PENDING_CALL_PARAMS
+    log.info("Preparing params for next call (acquiring _PARAMS_LOCK).")
+    acquired = _PARAMS_LOCK.acquire(timeout=10.0)
+    if not acquired:
+        log.error("Timeout acquiring _PARAMS_LOCK in _prepare_params_for_next_call.")
+        raise RuntimeError("Lock acquisition timeout")
     try:
-        while True:
-            # Keep-alive; we do not expect messages from clients. Close on disconnect.
-            msg = ws.receive()
-            if msg is None:
-                break
-    except Exception:
-        pass
+        _PENDING_CALL_PARAMS = _select_next_call_params_locked()
+        log.info("Prepared params for next call: %s", _PENDING_CALL_PARAMS)
     finally:
-        with _audio_clients_lock:
-            _audio_clients.discard(ws)
-        try:
-            ws.close()
-        except Exception:
-            pass
+        _PARAMS_LOCK.release()
+        log.info("Released _PARAMS_LOCK after preparing params.")
 
 
-# ====== Status, recording, and persistence ======
-
-def _history_csv_headers() -> List[str]:
-    return ["callSid", "startedAt", "durationSec", "outcome", "transcript", "prompt"]
-
-
-def _ensure_history_dir() -> None:
-    directory = os.path.dirname(_HISTORY_CSV_PATH)
-    if directory and not os.path.isdir(directory):
-        os.makedirs(directory, exist_ok=True)
-
-
-def _history_load_from_csv() -> None:
-    global _history, _persisted_call_sids
-    path = _HISTORY_CSV_PATH
-    if not os.path.isfile(path):
+def _assign_params_to_sid(sid: str) -> None:
+    """
+    Assign the prepared params to a specific CallSid.
+    """
+    global _PENDING_CALL_PARAMS
+    if not sid:
+        return
+    log.info("Assigning params to SID %s (acquiring _PARAMS_LOCK).", _mask_sid(sid))
+    acquired = _PARAMS_LOCK.acquire(timeout=10.0)
+    if not acquired:
+        log.error("Timeout acquiring _PARAMS_LOCK in _assign_params_to_sid.")
         return
     try:
-        with _history_file_lock, open(path, "r", encoding="utf-8", newline="") as f:
-            reader = csv.DictReader(f)
-            rows = list(reader)
-        loaded: List[Dict[str, Any]] = []
-        for r in rows:
-            call_sid = r.get("callSid", "").strip()
-            if not call_sid:
-                continue
-            try:
-                started_at = int(r.get("startedAt") or "0")
-            except Exception:
-                started_at = 0
-            try:
-                duration_sec = int(r.get("durationSec") or "0")
-            except Exception:
-                duration_sec = 0
-            outcome = r.get("outcome", "") or ""
-            transcript_json = r.get("transcript", "") or "[]"
-            try:
-                transcript = json.loads(transcript_json)
-                if not isinstance(transcript, list):
-                    transcript = []
-            except Exception:
-                transcript = []
-            prompt_val = r.get("prompt", "") or ""
-            loaded.append({
-                "callSid": call_sid,
-                "startedAt": started_at,
-                "durationSec": duration_sec,
-                "outcome": outcome,
-                "transcript": transcript,
-                "prompt": prompt_val,
+        if _PENDING_CALL_PARAMS is None:
+            _PENDING_CALL_PARAMS = _select_next_call_params_locked()
+        _CALL_PARAMS_BY_SID[sid] = _PENDING_CALL_PARAMS
+        log.info("Assigned params to SID %s: %s", _mask_sid(sid), _PENDING_CALL_PARAMS)
+        _PENDING_CALL_PARAMS = None
+    finally:
+        _PARAMS_LOCK.release()
+        log.info("Released _PARAMS_LOCK after assigning params.")
+
+
+def _get_params_for_sid(sid: str) -> CallParams:
+    acquired = _PARAMS_LOCK.acquire(timeout=10.0)
+    if not acquired:
+        log.error("Timeout acquiring _PARAMS_LOCK in _get_params_for_sid; falling back to defaults.")
+        return CallParams(voice=_runtime.tts_voice or "man", dialog_idx=0)
+    try:
+        cp = _CALL_PARAMS_BY_SID.get(sid)
+        if cp:
+            return cp
+        return CallParams(voice=_runtime.tts_voice or "man", dialog_idx=0)
+    finally:
+        _PARAMS_LOCK.release()
+
+
+def _get_dialog_lines(idx: int) -> List[str]:
+    if not _DIALOGS:
+        return ["Hello.", "Goodbye."]
+    return _DIALOGS[idx % len(_DIALOGS)]
+
+
+def _should_record_call() -> bool:
+    mode = (_runtime.recording_mode or "off").lower()
+    if mode != "on":
+        return False
+    if _runtime.recording_jurisdiction_mode == "disable_in_two_party":
+        return False
+    return True
+
+
+def _compose_followup_prompts(turn_seed: int) -> List[str]:
+    if _runtime.rotate_prompts and IV_PROMPTS:
+        idx = abs(turn_seed) % len(IV_PROMPTS)
+        try:
+            text = IV_PROMPTS[idx].format(
+                company_name=_runtime.company_name or "",
+                topic=_runtime.topic or "the topic",
+            )
+        except Exception:
+            text = IV_PROMPTS[idx]
+        parts = [p.strip() for p in text.split("||") if p.strip()]
+        return parts[:2] if parts else ["Could you elaborate?", "What details can you provide?"]
+    return ["Could you clarify?", "What details can you share?"]
+
+
+def _compose_assistant_reply(call_sid: str, turn: int) -> List[str]:
+    params = _get_params_for_sid(call_sid)
+    if turn <= 1:
+        dialog_lines = _get_dialog_lines(params.dialog_idx)
+        reply = dialog_lines[1] if len(dialog_lines) > 1 else "Please continue."
+        return [reply]
+    seed = params.dialog_idx + turn
+    return _compose_followup_prompts(seed)
+
+
+def _public_url_warnings(url: Optional[str]) -> List[str]:
+    warnings: List[str] = []
+    if not url:
+        warnings.append("missing_public_base_url")
+        return warnings
+    try:
+        u = urlparse(url)
+        host = (u.hostname or "").lower()
+        if host in ("localhost", "127.0.0.1"):
+            warnings.append("public_base_url_is_localhost")
+        if host.startswith("192.168.") or host.startswith("10.") or host.startswith("172.16.") or host.startswith("172.17.") or host.startswith("172.18.") or host.startswith("172.19.") or host.startswith("172.2") or host.startswith("172.3"):
+            warnings.append("public_base_url_is_private_lan")
+        if not u.scheme or u.scheme not in ("http", "https"):
+            warnings.append("public_base_url_invalid_scheme")
+    except Exception:
+        warnings.append("public_base_url_parse_error")
+    return warnings
+
+
+def _diagnostics_ready_to_call() -> Tuple[bool, List[str]]:
+    reasons: List[str] = []
+    if not _runtime.to_number:
+        reasons.append("missing_to_number")
+    from_n = _choose_from_number()
+    if not from_n:
+        reasons.append("missing_from_number")
+    if _ensure_twilio_client() is None:
+        reasons.append("twilio_client_not_initialized")
+    warnings = _public_url_warnings(_runtime.public_base_url)
+    if warnings:
+        reasons.extend(warnings)
+    fatal = [r for r in reasons if r in ("missing_to_number", "missing_from_number", "twilio_client_not_initialized")]
+    return (len(fatal) == 0), reasons
+
+
+def _place_call_now() -> bool:
+    """
+    Place an outbound call via Twilio REST API. Includes detailed step logs.
+    """
+    log.info("STEP place_call_now: start")
+    client = _ensure_twilio_client()
+    from_n = _choose_from_number()
+    public_url = _runtime.public_base_url or ""
+    to_n = _runtime.to_number
+
+    if not client:
+        log.error("Cannot place call: Twilio client missing.")
+        _set_last_dial_error("Twilio client missing")
+        return False
+    if not to_n:
+        log.error("Cannot place call: TO_NUMBER is not configured.")
+        _set_last_dial_error("TO_NUMBER is not configured")
+        return False
+    if not from_n:
+        log.error("Cannot place call: FROM_NUMBER or FROM_NUMBERS is not configured.")
+        _set_last_dial_error("FROM_NUMBER or FROM_NUMBERS is not configured")
+        return False
+    if not public_url:
+        log.error("Cannot place call: PUBLIC_BASE_URL is not set.")
+        _set_last_dial_error("PUBLIC_BASE_URL is not set")
+        return False
+
+    url_warn = _public_url_warnings(public_url)
+    if url_warn:
+        log.warning("PUBLIC_BASE_URL warnings: %s (value=%s)", url_warn, public_url)
+
+    try:
+        log.info("Preparing to place call (preflight). to=%s from=%s base=%s", _mask_phone(to_n), _mask_phone(from_n), public_url)
+
+        # STEP: parameter selection (fixed deadlock)
+        _prepare_params_for_next_call()
+        log.info("STEP place_call_now: params prepared")
+
+        # Build Twilio call kwargs
+        kwargs: Dict[str, Any] = dict(
+            to=to_n,
+            from_=from_n,
+            url=f"{public_url}/voice",
+            status_callback=f"{public_url}/status",
+            status_callback_event=["initiated", "ringing", "answered", "completed"],
+            status_callback_method="POST",
+        )
+        if _should_record_call():
+            kwargs.update({
+                "record": True,
+                "recording_status_callback": f"{public_url}/recording-status",
+                "recording_status_callback_event": ["in-progress", "completed"],
+                "recording_status_callback_method": "POST",
             })
-        with _history_lock:
-            _history = loaded
-        _persisted_call_sids = {h["callSid"] for h in loaded if h.get("callSid")}
-        logging.info("Loaded %s historical call(s) from %s", len(loaded), path)
+        log.info("STEP place_call_now: kwargs built (twiml_url=%s, status_cb=%s)", kwargs["url"], kwargs["status_callback"])
+
+        log.info(
+            "Placing call via Twilio API. to=%s from=%s twiml_url=%s",
+            _mask_phone(kwargs["to"]),
+            _mask_phone(kwargs["from_"]),
+            kwargs["url"],
+        )
+
+        # Execute REST create
+        call = client.calls.create(**kwargs)  # type: ignore
+
+        sid = getattr(call, "sid", "") or ""
+        log.info("Twilio accepted call. CallSid=%s", _mask_sid(sid) or "<none>")
+
+        _clear_last_dial_error()
+        _note_attempt(time.time(), to_n)
+        _mark_outgoing_pending()
+        if sid:
+            _assign_params_to_sid(sid)
+            _init_call_meta_if_absent(sid, to=to_n, from_n=from_n, started_at=int(time.time()))
+        return True
     except Exception as e:
-        logging.error("Failed to load history CSV (%s): %s", path, str(e))
+        msg = f"Twilio call placement failed: {e}"
+        log.exception(msg)
+        _set_last_dial_error(msg)
+        return False
 
 
-def _history_append_to_csv(entry: Dict[str, Any]) -> None:
-    call_sid = entry.get("callSid", "")
-    if not call_sid:
+def _initialize_schedule_if_needed(now: int) -> None:
+    global _next_call_epoch_s, _interval_start_epoch_s, _interval_total_seconds
+    with _next_call_epoch_s_lock:
+        if _next_call_epoch_s is None:
+            _interval_total_seconds = _compute_next_interval_seconds()
+            _interval_start_epoch_s = now
+            _next_call_epoch_s = now + int(_interval_total_seconds or 0)
+            log.info(
+                "Initialized schedule: next_call_epoch=%s (in %ss), interval_total=%ss",
+                _next_call_epoch_s,
+                (_next_call_epoch_s - now) if _next_call_epoch_s else None,
+                _interval_total_seconds,
+            )
+
+
+def _reset_schedule_after_completion(now: int) -> None:
+    global _next_call_epoch_s, _interval_start_epoch_s, _interval_total_seconds
+    with _next_call_epoch_s_lock:
+        interval = _compute_next_interval_seconds()
+        prev_next = _next_call_epoch_s
+        _interval_total_seconds = interval
+        _interval_start_epoch_s = now
+        _next_call_epoch_s = now + int(interval)
+        log.info(
+            "Reset schedule after completion: prev_next=%s, new_next=%s (in %ss), interval_total=%ss",
+            prev_next,
+            _next_call_epoch_s,
+            (_next_call_epoch_s - now) if _next_call_epoch_s else None,
+            _interval_total_seconds,
+        )
+
+
+def _log_dialer_gates(label: str) -> Dict[str, Any]:
+    now_ts = int(time.time())
+    active_sid = _get_current_call_sid()
+    pending = _is_outgoing_pending()
+    within = _within_active_window(_now_local())
+    ready, reasons = _diagnostics_ready_to_call()
+    can_now, wait_s = (True, 0)
+    if _runtime.to_number:
+        can_now, wait_s = _can_attempt(now_ts, _runtime.to_number)
+    snapshot = dict(
+        label=label,
+        active_sid_set=bool(active_sid),
+        pending=pending,
+        within_active_window=within,
+        ready=ready,
+        reasons=reasons,
+        can_attempt=can_now,
+        wait_if_capped=wait_s,
+        to=_mask_phone(_runtime.to_number),
+        from_single=_mask_phone(_runtime.from_number),
+        from_pool_count=len(_runtime.from_numbers or []),
+        public_url_set=bool(_runtime.public_base_url),
+    )
+    log.info("Dialer gates [%s]: %s", label, snapshot)
+    return snapshot
+
+
+def _dialer_loop() -> None:
+    log.info("Dialer thread started.")
+    while not _stop_requested.is_set():
+        try:
+            now = int(time.time())
+            _initialize_schedule_if_needed(now)
+
+            # Manual request (from /api/call-now if not direct-dial)
+            if _manual_call_requested.is_set():
+                _manual_call_requested.clear()
+                log.info("Manual call request received by dialer.")
+                gates = _log_dialer_gates("manual")
+                if not gates["ready"]:
+                    log.error("Manual call suppressed; not ready: %s", gates["reasons"])
+                else:
+                    if (not gates["active_sid_set"]) and gates["within_active_window"]:
+                        if gates["can_attempt"]:
+                            log.info("Manual dialer path proceeding to place call now.")
+                            ok = _place_call_now()
+                            log.info("Manual dialer path place_call_now result=%s", ok)
+                            if not ok:
+                                log.error("Manual call attempt failed. Rescheduling.")
+                                _reset_schedule_after_completion(now)
+                        else:
+                            log.info("Manual attempt blocked by caps; wait %s seconds.", gates["wait_if_capped"])
+                    else:
+                        log.info("Manual attempt suppressed; active_sid=%s within_window=%s", gates["active_sid_set"], gates["within_active_window"])
+
+            # Automatic schedule-based attempt
+            with _next_call_epoch_s_lock:
+                ready_time = (_next_call_epoch_s is not None and now >= _next_call_epoch_s)
+                seconds_until = max(0, (_next_call_epoch_s - now)) if _next_call_epoch_s else None
+
+            if ready_time:
+                log.info("Schedule window reached. seconds_until_next=%s", seconds_until)
+                gates = _log_dialer_gates("scheduled")
+                if not gates["ready"]:
+                    log.error("Scheduled attempt suppressed; not ready: %s", gates["reasons"])
+                    _reset_schedule_after_completion(now)
+                elif gates["pending"]:
+                    log.info("Scheduled attempt suppressed; reason=outgoing_pending")
+                    _reset_schedule_after_completion(now)
+                elif gates["active_sid_set"]:
+                    log.info("Scheduled attempt suppressed; reason=current_call_in_progress sid=%s", _mask_sid(_get_current_call_sid()))
+                    _reset_schedule_after_completion(now)
+                elif not gates["within_active_window"]:
+                    log.info("Scheduled attempt suppressed; reason=outside_active_window")
+                    _reset_schedule_after_completion(now)
+                else:
+                    if gates["can_attempt"]:
+                        log.info("Scheduled dialer proceeding to place call now.")
+                        ok = _place_call_now()
+                        log.info("Scheduled dialer place_call_now result=%s", ok)
+                        if not ok:
+                            log.error("Scheduled call attempt failed. Rescheduling.")
+                            _reset_schedule_after_completion(now)
+                    else:
+                        log.info("Scheduled attempt blocked by caps; rescheduling. wait=%s", gates["wait_if_capped"])
+                        _reset_schedule_after_completion(now)
+
+            for _ in range(5):
+                if _stop_requested.is_set():
+                    break
+                time.sleep(0.2)
+        except Exception as e:
+            log.exception("Dialer loop error: %s", e)
+            time.sleep(0.5)
+
+    log.info("Dialer thread stopped.")
+
+
+# Transcripts and call metadata
+_TRANSCRIPTS_LOCK = threading.Lock()
+_TRANSCRIPTS: Dict[str, List[Dict[str, Any]]] = {}
+
+_CALL_META_LOCK = threading.Lock()
+_CALL_META: Dict[str, Dict[str, Any]] = {}
+
+HISTORY_DIR = Path("data/history")
+HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _append_transcript(call_sid: str, role: str, text: str, is_final: bool) -> None:
+    if not text:
         return
-
-    with _history_file_lock:
-        if call_sid in _persisted_call_sids:
-            return
-        _ensure_history_dir()
-        path = _HISTORY_CSV_PATH
-        file_exists = os.path.isfile(path)
-        try:
-            with open(path, "a", encoding="utf-8", newline="") as f:
-                writer = csv.DictWriter(f, fieldnames=_history_csv_headers())
-                if not file_exists or os.path.getsize(path) == 0:
-                    writer.writeheader()
-                writer.writerow({
-                    "callSid": entry.get("callSid", ""),
-                    "startedAt": int(entry.get("startedAt", 0) or 0),
-                    "durationSec": int(entry.get("durationSec", 0) or 0),
-                    "outcome": entry.get("outcome", "") or "",
-                    "transcript": json.dumps(entry.get("transcript", []), ensure_ascii=False),
-                    "prompt": entry.get("prompt", "") or "",
-                })
-            _persisted_call_sids.add(call_sid)
-        except Exception as e:
-            logging.error("Failed to append history to CSV: %s", str(e))
+    entry = {"t": time.time(), "role": role, "text": text, "final": bool(is_final)}
+    with _TRANSCRIPTS_LOCK:
+        _TRANSCRIPTS.setdefault(call_sid, []).append(entry)
+    log.debug("Transcript appended (%s): role=%s, final=%s, len(text)=%s", _mask_sid(call_sid), role, is_final, len(text))
 
 
-@app.route("/status", methods=["POST"])
-def status_handler() -> Response:
-    call_sid = request.form.get("CallSid", "")
-    raw_event = request.form.get("StatusCallbackEvent", "") or ""
-    call_status = request.form.get("CallStatus", "") or ""
-    answered_by = request.form.get("AnsweredBy", "")
-    sip_code = request.form.get("SipResponseCode", "")
-    call_duration = request.form.get("CallDuration", "")
+def _init_call_meta_if_absent(sid: str, **kwargs: Any) -> None:
+    with _CALL_META_LOCK:
+        meta = _CALL_META.get(sid)
+        if meta is None:
+            meta = {}
+            _CALL_META[sid] = meta
+        for k, v in kwargs.items():
+            if k not in meta or meta.get(k) in (None, "", 0):
+                meta[k] = v
+    log.debug("Initialized call meta if absent for %s with keys=%s", _mask_sid(sid), list(kwargs.keys()))
 
-    event = (raw_event or call_status or "").lower()
 
-    if call_sid:
-        _record_event(call_sid, event=event, call_status=call_status, answered_by=answered_by or None, sip_code=sip_code or None, duration=call_duration or None)
+def _persist_call_history(sid: str) -> None:
+    with _CALL_META_LOCK:
+        meta = dict(_CALL_META.get(sid, {}))
+    with _TRANSCRIPTS_LOCK:
+        transcript = list(_TRANSCRIPTS.get(sid, []))
+    if not sid:
+        return
+    try:
+        # Use SQLite database instead of JSON files
+        persist_call_history_json(sid, meta, transcript)
+        log.info("Persisted call history for %s (%s entries).", _mask_sid(sid), len(transcript))
+    except Exception as e:
+        log.error("Failed to persist call history: %s", e)
 
-    with _diag_lock:
-        diag = _call_diag.get(call_sid, {})
-        from_number = diag.get("from_number")
-        interval_chosen = diag.get("interval_chosen_s")
-        backoff_applied = diag.get("backoff_applied_s")
-        selected_prompt = diag.get("prompt") or ""
 
-    logging.info(
-        "Status callback: event=%s call_status=%s answered_by=%s sip_code=%s duration=%s CallSid=%s from=%s interval=%s backoff=%s",
-        event or "<none>", call_status or "<none>", answered_by or "<none>", sip_code or "<none>", call_duration or "<none>",
-        call_sid or "<none>", from_number or "<none>", str(interval_chosen or ""), str(backoff_applied or "")
+def _load_call_history(sid: str) -> Optional[Dict[str, Any]]:
+    return load_call_history_json(sid)
+
+
+def _scan_history_summaries(limit: int = 200) -> List[Dict[str, Any]]:
+    """
+    Collect history items from the SQLite database.
+
+    Each item is a summary object with keys:
+      - sid
+      - started_at (epoch seconds, int or None)
+      - completed_at (epoch seconds, int or None)
+      - to
+      - from
+      - duration_seconds (int)
+      - has_recordings (bool)
+    """
+    return scan_history_summaries(limit)
+
+
+def _compute_history_metrics() -> Dict[str, Any]:
+    """
+    Compute aggregate metrics from SQLite database:
+    - total_calls: number of call records
+    - total_duration_seconds: sum of duration_seconds where present
+    - average_call_seconds: computed if total_calls > 0
+    """
+    return compute_history_metrics()
+
+
+def _log_runtime_summary(context: str = "startup") -> None:
+    ready, reasons = _diagnostics_ready_to_call()
+    log.info(
+        "Runtime summary (%s): to=%s, from_single=%s, from_pool=%s, public_url_set=%s, "
+        "active_hours=%s on %s, interval=%ss..%ss, caps(hour/day)=%s/%s, rotate_prompts=%s, "
+        "media_streams=%s, use_ngrok=%s, ready_to_call=%s, reasons=%s",
+        context,
+        _mask_phone(_runtime.to_number),
+        _mask_phone(_runtime.from_number),
+        ",".join(_mask_phone(n) for n in _runtime.from_numbers) or "-",
+        bool(_runtime.public_base_url),
+        _runtime.active_hours_local,
+        ",".join(_runtime.active_days),
+        _runtime.min_interval_seconds,
+        _runtime.max_interval_seconds,
+        _runtime.hourly_max_attempts,
+        _runtime.daily_max_attempts,
+        _runtime.rotate_prompts,
+        _runtime.enable_media_streams,
+        _runtime.use_ngrok,
+        ready,
+        reasons,
     )
 
-    terminal_statuses = {"completed", "busy", "no-answer", "failed", "canceled"}
-    is_terminal = (event == "completed") or (call_status.lower() in terminal_statuses)
 
-    if is_terminal:
-        outcome = _classify_outcome(call_sid)
+# UI routes
+@app.route("/")
+def root():
+    log.info("GET / -> redirect to /scamcalls")
+    return redirect(url_for("scamcalls"))
 
-        try:
-            with _call_state_lock:
-                st = _call_state.get(call_sid)
-                segments = list(st["segments"]) if st else []
-                started_at = float(st["start_ts"]) if st and st.get("start_ts") else time.time()
-            transcript_msgs: List[Dict[str, Any]] = []
-            now_ts = int(time.time())
-            for seg in segments:
-                role = "Assistant" if seg.startswith("Assistant: ") else ("Callee" if seg.startswith("Callee: ") else "System")
-                text = seg.split(": ", 1)[1] if ": " in seg else seg
-                transcript_msgs.append({"role": role, "text": text, "ts": now_ts})
-            entry = {
-                "callSid": call_sid,
-                "startedAt": int(started_at),
-                "durationSec": int(call_duration or "0") if (call_duration or "").isdigit() else 0,
-                "outcome": outcome,
-                "transcript": transcript_msgs,
-                "prompt": selected_prompt or "",
-            }
-            with _history_lock:
-                _history.append(entry)
-            _history_append_to_csv(entry)
-        except Exception as e:
-            logging.error("Failed to persist call history: %s", str(e))
-
-        to_number = request.form.get("To", "")
-        if to_number:
-            _update_backoff(to_number, outcome)
-
-        _cancel_forced_hangup(call_sid)
-        _finalize_transcript(call_sid)
-
-        with _call_state_lock:
-            st = _call_state.pop(call_sid, None)
-            if st and st.get("live_utterance", {}).get("inactivity_timer"):
-                try:
-                    st["live_utterance"]["inactivity_timer"].cancel()
-                except Exception:
-                    pass
-        with _diag_lock:
-            _call_diag.pop(call_sid, None)
-
-    return Response("", status=204)
-
-
-@app.route("/recording-status", methods=["POST"])
-def recording_status_handler() -> Response:
-    call_sid = request.form.get("CallSid", "")
-    rec_sid = request.form.get("RecordingSid", "")
-    rec_status = request.form.get("RecordingStatus", "")
-    rec_url = request.form.get("RecordingUrl", "")
-    rec_channels = request.form.get("RecordingChannels", "")
-    rec_source = request.form.get("RecordingSource", "")
-
-    if call_sid and rec_sid:
-        d = _ensure_diag_state(call_sid)
-        with _diag_lock:
-            if rec_url:
-                d["recording_urls"].append(rec_url)
-            d["recording_sids"].append(rec_sid)
-
-    logging.info(
-        "Recording callback: CallSid=%s RecordingSid=%s Status=%s Channels=%s Source=%s URL=%s",
-        call_sid or "<none>", rec_sid or "<none>", rec_status or "<none>", rec_channels or "<none>", rec_source or "<none>", rec_url or "<none>"
-    )
-
-    return Response("", status=204)
-
-
-# ====== Web UI pages and favicon ======
 
 @app.route("/scamcalls", methods=["GET"])
-def ui_live_page() -> Response:
-    return render_template("scamcalls.html")
+def scamcalls():
+    log.info("GET /scamcalls (admin=%s)", _admin_authenticated())
+    return render_template("scamcalls.html", is_admin=_admin_authenticated())
 
 
 @app.route("/scamcalls/history", methods=["GET"])
-def ui_history_page() -> Response:
-    return render_template("scamcalls_history.html")
+def scamcalls_history():
+    log.info("GET /scamcalls/history")
+    return render_template("history.html")
 
 
-@app.route("/favicon.ico")
-def favicon_compat() -> Response:
-    return send_from_directory(os.path.join(app.root_path, "static"), "favicon.ico", mimetype="image/x-icon")
+@app.route("/scamcalls/speech", methods=["GET"])
+def scamcalls_speech():
+    log.info("GET /scamcalls/speech")
+    return render_template("speech.html")
 
 
-# ====== Web UI APIs ======
-
-def _format_active_window_label() -> str:
-    days = "–".join([_ACTIVE_DAYS[0], _ACTIVE_DAYS[-1]]) if _ACTIVE_DAYS else ""
-    return f"{days} {_ACTIVE_HOURS_LOCAL}" if days else _ACTIVE_HOURS_LOCAL
-
-
-def _current_active_call() -> Optional[str]:
-    with _call_state_lock:
-        active = [(sid, st) for sid, st in _call_state.items() if not st.get("closed", False)]
-        if not active:
-            return None
-        active.sort(key=lambda kv: kv[1].get("start_ts", 0.0), reverse=True)
-        return active[0][0]
+@app.route("/scamcalls/messages", methods=["GET"])
+def scamcalls_messages():
+    log.info("GET /scamcalls/messages")
+    return render_template("messages.html")
 
 
-def _segments_to_messages(call_sid: str, include_partial: bool = True) -> List[Dict[str, Any]]:
-    messages: List[Dict[str, Any]] = []
-    now_ts = int(time.time())
-    with _call_state_lock:
-        st = _call_state.get(call_sid)
-        if not st:
-            return messages
-        segs = list(st.get("segments", []))
-        live_buf = st.get("live_utterance", {}).get("buffer", "")
-    for seg in segs:
-        if seg.startswith("Assistant: "):
-            messages.append({"role": "Assistant", "text": seg[len("Assistant: "):], "ts": now_ts})
-        elif seg.startswith("Callee: "):
-            messages.append({"role": "Callee", "text": seg[len("Callee: "):], "ts": now_ts})
-        else:
-            messages.append({"role": "System", "text": seg, "ts": now_ts})
-    if include_partial and live_buf:
-        messages.append({"role": "Callee", "text": live_buf, "partial": True, "ts": now_ts})
-    return messages
+# Admin auth
+def _admin_defaults() -> Tuple[str, Optional[str], bool]:
+    env_user = (os.environ.get("ADMIN_USER") or "").strip() or (_runtime.admin_user or "").strip() if _runtime.admin_user else None
+    env_hash = (os.environ.get("ADMIN_PASSWORD_HASH") or "").strip() or (_runtime.admin_password_hash or "").strip() if _runtime.admin_password_hash else None
+    if env_user and env_hash and bcrypt is not None:
+        return env_user, env_hash, True
+    return "bootycall", None, False
 
 
-@app.route("/api/scamcalls/status", methods=["GET"])
-def api_status() -> Response:
-    active_sid = _current_active_call()
-    data = {
-        "active": bool(active_sid),
-        "callSid": active_sid,
-        "nextCallEpochSec": int(_next_call_epoch_s) if _next_call_epoch_s else None,
-        "nextCallStartEpochSec": int(_next_call_start_epoch_s) if _next_call_start_epoch_s else None,
-        "destNumber": _DEST_NUMBER or "",
-        "fromNumber": _last_from_number or "",
-        "activeWindow": _format_active_window_label(),
-        "caps": {"hourly": _HOURLY_MAX_PER_DEST, "daily": _DAILY_MAX_PER_DEST},
-        "publicUrl": _PUBLIC_BASE_URL or "",
-    }
-    return jsonify(data)
+def _admin_authenticated() -> bool:
+    return bool(session.get("is_admin") is True)
 
 
-@app.route("/api/scamcalls/active", methods=["GET"])
-def api_active() -> Response:
-    active_sid = _current_active_call()
-    if not active_sid:
-        return jsonify({"status": "idle"}), 200
-    messages = _segments_to_messages(active_sid, include_partial=True)
-    with _call_state_lock:
-        st = _call_state.get(active_sid)
-        connected_at = int(st.get("start_ts", time.time())) if st else int(time.time())
-        status = "connected" if st and not st.get("closed", False) else "completed"
+def _require_admin_for_api() -> Optional[Response]:
+    if not _admin_authenticated():
+        log.warning("Admin API unauthorized access attempt.")
+        return Response(json.dumps({"error": "unauthorized"}), status=401, mimetype="application/json")
+    return None
+
+
+@app.route("/admin/login", methods=["GET", "POST"])
+def admin_login():
+    if request.method == "GET":
+        if _admin_authenticated():
+            log.info("GET /admin/login: already authenticated -> redirect")
+            return redirect(url_for("scamcalls"))
+        log.info("GET /admin/login: render login page")
+        return render_template("admin_login.html", error=None)
+    username = (request.form.get("username") or "").strip()
+    effective_user, effective_hash, uses_hash = _admin_defaults()
+    ok = False
+    if uses_hash and effective_hash and bcrypt is not None:
+        if username == effective_user:
+            try:
+                ok = bcrypt.checkpw((request.form.get("password") or "").encode("utf-8"), effective_hash.encode("utf-8"))
+            except Exception:
+                ok = False
+    else:
+        ok = (username == effective_user and (request.form.get("password") or "") == "scammers")
+    log.info("POST /admin/login: user=%s, success=%s, uses_hash=%s", username, ok, uses_hash)
+    if not ok:
+        return render_template("admin_login.html", error="Invalid credentials.")
+    session["is_admin"] = True
+    return redirect(url_for("scamcalls"))
+
+
+@app.route("/admin/logout", methods=["GET"])
+def admin_logout():
+    log.info("GET /admin/logout")
+    session.pop("is_admin", None)
+    return redirect(url_for("scamcalls"))
+
+
+# Admin env editor
+@app.route("/api/admin/env", methods=["GET"])
+def api_admin_env_get():
+    resp = _require_admin_for_api()
+    if resp:
+        return resp
+    editable = [{"key": k, "value": v} for (k, v) in _current_env_editable_pairs()]
+    log.info("GET /api/admin/env -> %s keys", len(editable))
+    return jsonify({"editable": editable})
+
+
+@app.route("/api/admin/env", methods=["POST"])
+def api_admin_env_post():
+    resp = _require_admin_for_api()
+    if resp:
+        return resp
+    try:
+        data = request.get_json(force=True, silent=False) or {}
+        updates_raw = data.get("updates") or {}
+        if not isinstance(updates_raw, dict):
+            log.error("POST /api/admin/env invalid payload type.")
+            return Response("Invalid payload.", status=400)
+        clean_updates: Dict[str, str] = {}
+        for k, v in updates_raw.items():
+            if k in _SECRET_ENV_KEYS:
+                continue
+            if k in _EDITABLE_ENV_KEYS:
+                clean_updates[str(k)] = "" if v is None else str(v)
+        log.info("POST /api/admin/env applying %s updates.", len(clean_updates))
+        _apply_env_updates(clean_updates)
+        # Reload runtime settings immediately so changes take effect right away
+        _reload_runtime_after_env_update()
+        return jsonify({"ok": True, "reloaded": True})
+    except Exception as e:
+        log.exception("Failed to save env updates: %s", e)
+        return Response("Failed to save settings.", status=500)
+
+
+# Speech settings API (open to all users)
+_SUPPORTED_VOICES = [
+    # Twilio built-ins
+    "man", "woman", "alice",
+    # Select Amazon Polly voices commonly available via Twilio
+    "Polly.Joanna", "Polly.Matthew", "Polly.Kendra", "Polly.Joey",
+    "Polly.Brian", "Polly.Amy", "Polly.Emma", "Polly.Russell",
+    "Polly.Nicole", "Polly.Geraint", "Polly.Lucy",
+]
+
+_SUPPORTED_LANGUAGES = [
+    "en-US", "en-GB", "en-AU", "en-CA",
+    "es-US", "es-ES", "fr-FR", "de-DE",
+    "it-IT", "pt-BR",
+]
+
+
+@app.route("/api/speech-settings", methods=["GET"])
+def api_speech_settings_get():
+    log.info("GET /api/speech-settings")
     return jsonify({
-        "callSid": active_sid,
-        "connectedAt": connected_at,
-        "transcript": messages,
-        "status": status,
+        "voices": _SUPPORTED_VOICES,
+        "languages": _SUPPORTED_LANGUAGES,
+        "values": {
+            "tts_voice": _runtime.tts_voice,
+            "tts_language": _runtime.tts_language,
+            "tts_rate_percent": _runtime.tts_rate_percent,
+            "tts_pitch_semitones": _runtime.tts_pitch_semitones,
+            "tts_volume_db": _runtime.tts_volume_db,
+            "greeting_pause_seconds": _runtime.greeting_pause_seconds,
+            "response_pause_seconds": _runtime.response_pause_seconds,
+            "between_phrases_pause_seconds": _runtime.between_phrases_pause_seconds,
+        }
     })
 
 
-@app.route("/api/scamcalls/history", methods=["GET"])
-def api_history() -> Response:
-    with _history_lock:
-        calls = [{"callSid": h["callSid"],
-                  "startedAt": h.get("startedAt", 0),
-                  "durationSec": h.get("durationSec", 0),
-                  "outcome": h.get("outcome", "")}
-                 for h in _history]
-    return jsonify({"calls": calls, "publicUrl": _PUBLIC_BASE_URL or ""})
-
-
-@app.route("/api/scamcalls/transcript/<call_sid>", methods=["GET"])
-def api_transcript(call_sid: str) -> Response:
-    with _history_lock:
-        for h in _history:
-            if h.get("callSid") == call_sid:
-                return jsonify({"callSid": call_sid,
-                                "transcript": h.get("transcript", []),
-                                "outcome": h.get("outcome", ""),
-                                "durationSec": h.get("durationSec", 0)})
-    with _call_state_lock:
-        if call_sid in _call_state:
-            msgs = _segments_to_messages(call_sid, include_partial=True)
-            st = _call_state[call_sid]
-            return jsonify({"callSid": call_sid,
-                            "transcript": msgs,
-                            "outcome": "",
-                            "durationSec": int(time.time() - st.get("start_ts", time.time()))})
-    return jsonify({"error": "CallSid not found"}), 404
-
-
-@app.route("/api/scamcalls/call-now", methods=["POST"])
-def api_call_now() -> Response:
-    _manual_call_requested.set()
-    logging.info("Call-now requested via API.")
-    return jsonify({"ok": True}), 200
-
-
-# ====== CLI setup and main loop ======
-
-def _sleep_with_manual_wake(wait_s: int) -> bool:
-    slept = 0
-    while slept < wait_s and not _STOP_REQUESTED:
-        if _manual_call_requested.is_set():
-            logging.info("Manual 'Call now' request received; interrupting wait.")
-            return True
-        time.sleep(min(1, wait_s - slept))
-        slept += 1
-    return False
-
-
-def _readline_with_timeout(prompt: str, timeout_s: int) -> Optional[str]:
+@app.route("/api/speech-settings", methods=["POST"])
+def api_speech_settings_post():
     try:
-        if not sys.stdin or not sys.stdin.isatty():
-            return None
+        data = request.get_json(force=True, silent=False) or {}
     except Exception:
-        return None
+        data = {}
+    updates: Dict[str, str] = {}
 
-    sys.stdout.write(prompt)
-    sys.stdout.flush()
+    voice = (data.get("tts_voice") or "").strip()
+    if voice and voice in _SUPPORTED_VOICES:
+        updates["TTS_VOICE"] = voice
 
-    try:
-        import select
-        rlist, _, _ = select.select([sys.stdin], [], [], timeout_s)
-        if rlist:
-            line = sys.stdin.readline()
-            return line.rstrip("\n")
-        else:
-            return None
-    except Exception:
-        return None
+    lang = (data.get("tts_language") or "").strip()
+    if lang and lang in _SUPPORTED_LANGUAGES:
+        updates["TTS_LANGUAGE"] = lang
 
-
-def interactive_setup(current_to: str) -> Tuple[str, bool]:
-    """
-    Minimal interactive setup with timeout. Defaults used if no TTY or no input within 10s.
-    """
-    if _NONINTERACTIVE:
-        return current_to, bool(_FROM_NUMBERS)
-
-    try:
-        if not sys.stdin or not sys.stdin.isatty():
-            logging.info("No TTY detected. Proceeding with defaults (non-interactive).")
-            return current_to, bool(_FROM_NUMBERS)
-    except Exception:
-        logging.info("Unable to determine TTY. Proceeding with defaults (non-interactive).")
-        return current_to, bool(_FROM_NUMBERS)
-
-    print("Run mode: calls (voice) only. SMS is not implemented in this version.")
-    print(f"Current destination: {current_to}")
-
-    override = _readline_with_timeout("Enter a destination E.164 number to override, or press Enter to keep (10s): ", 10)
-    if override is None:
-        print("\nNo input received within 10s; keeping current destination.")
-    elif override.strip():
+    def clamp_int(val, lo, hi, default):
         try:
-            current_to = normalize_to_e164(override.strip())
-        except Exception as e:
-            print(f"Invalid number; keeping existing. Error: {e}")
+            v = int(val)
+        except Exception:
+            v = default
+        return max(lo, min(hi, v))
 
-    # Rotation flag not used; random selection is always applied when pool exists.
-    return current_to, bool(_FROM_NUMBERS)
+    def clamp_float(val, lo, hi, default):
+        try:
+            v = float(val)
+        except Exception:
+            v = default
+        v = max(lo, min(hi, v))
+        return round(v, 2)
+
+    updates["TTS_RATE_PERCENT"] = str(clamp_int(data.get("tts_rate_percent"), 50, 200, _runtime.tts_rate_percent))
+    updates["TTS_PITCH_SEMITONES"] = str(clamp_int(data.get("tts_pitch_semitones"), -12, 12, _runtime.tts_pitch_semitones))
+    updates["TTS_VOLUME_DB"] = str(clamp_int(data.get("tts_volume_db"), -6, 6, _runtime.tts_volume_db))
+
+    updates["GREETING_PAUSE_SECONDS"] = str(clamp_float(data.get("greeting_pause_seconds"), 0.0, 5.0, _runtime.greeting_pause_seconds))
+    updates["RESPONSE_PAUSE_SECONDS"] = str(clamp_float(data.get("response_pause_seconds"), 0.0, 5.0, _runtime.response_pause_seconds))
+    updates["BETWEEN_PHRASES_PAUSE_SECONDS"] = str(clamp_float(data.get("between_phrases_pauses_seconds") if "between_phrases_pauses_seconds" in data else data.get("between_phrases_pause_seconds"), 0.0, 5.0, _runtime.between_phrases_pause_seconds))
+
+    _apply_env_updates(updates)
+    return jsonify(ok=True, values={
+        "tts_voice": _runtime.tts_voice,
+        "tts_language": _runtime.tts_language,
+        "tts_rate_percent": _runtime.tts_rate_percent,
+        "tts_pitch_semitones": _runtime.tts_pitch_semitones,
+        "tts_volume_db": _runtime.tts_volume_db,
+        "greeting_pause_seconds": _runtime.greeting_pause_seconds,
+        "response_pause_seconds": _runtime.response_pause_seconds,
+        "between_phrases_pause_seconds": _runtime.between_phrases_pause_seconds,
+    })
 
 
-def main() -> int:
-    global _DEST_NUMBER, _last_from_number, _next_call_epoch_s, _next_call_start_epoch_s
-    setup_logging()
-    signal.signal(signal.SIGINT, _handle_stop)
-    signal.signal(signal.SIGTERM, _handle_stop)
+# Messages rotation (max 10)
+MESSAGES_FILE = DATA_DIR / "messages.json"
+_USER_MESSAGES_LOCK = threading.Lock()
+_USER_MESSAGES: List[str] = []
 
-    # Load persisted history at startup before serving UI
-    _history_load_from_csv()
 
-    account_sid = os.getenv("TWILIO_ACCOUNT_SID")
-    auth_token = os.getenv("TWILIO_AUTH_TOKEN")
-    raw_from = os.getenv("FROM_NUMBER", "")
-    raw_to = os.getenv("TO_NUMBER", "")
-
-    if not all([account_sid, auth_token]) or (not raw_from and not os.getenv("FROM_NUMBERS", "").strip()) or not raw_to:
-        logging.error("Missing required environment variables. Ensure TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TO_NUMBER and either FROM_NUMBER or FROM_NUMBERS are set.")
-        return 2
-
+def _load_user_messages_from_disk() -> List[str]:
+    if not MESSAGES_FILE.exists():
+        return []
     try:
-        allowed_cc = parse_allowed_country_codes(os.getenv("ALLOWED_COUNTRY_CODES", "+1"))
-    except ValueError as e:
-        logging.error(str(e))
-        return 2
-
-    try:
-        _load_from_numbers()
-    except Exception as e:
-        logging.error("Failed to load FROM_NUMBERS: %s", str(e))
-        return 2
-
-    try:
-        if _FROM_NUMBERS:
-            for fn in _FROM_NUMBERS:
-                enforce_country_allowlist(fn, allowed_cc)
+        raw = json.loads(MESSAGES_FILE.read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            items = raw.get("messages", [])
         else:
-            raw_from = normalize_to_e164(raw_from)
-            enforce_country_allowlist(raw_from, allowed_cc)
-        to_number = normalize_to_e164(raw_to)
-        enforce_country_allowlist(to_number, allowed_cc)
-    except ValueError as e:
-        logging.error(str(e))
-        return 2
+            items = raw
+        out: List[str] = []
+        for s in items:
+            if isinstance(s, str):
+                t = s.strip()
+                if t:
+                    out.append(t)
+        return out[:10]
+    except Exception:
+        return []
 
-    _DEST_NUMBER = to_number
 
-    _, _rotate_pool = interactive_setup(to_number)
-
+def _persist_user_messages_to_disk(msgs: List[str]) -> None:
     try:
-        public_base_url, server_thread = ensure_public_base_url()
+        MESSAGES_FILE.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"messages": msgs[:10]}
+        MESSAGES_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        log.info("Persisted %s user messages for rotation.", len(payload["messages"]))
     except Exception as e:
-        logging.error("Failed to establish public URL: %s", str(e))
-        return 2
+        log.error("Failed to persist user messages: %s", e)
 
-    global _TWILIO_CLIENT
-    http_client = TwilioHttpClient(timeout=30)
-    _TWILIO_CLIENT = Client(account_sid, auth_token, http_client=http_client)
 
-    logging.info(
-        "Starting call loop. MIN_INTERVAL=%ss, MAX_INTERVAL=%ss. Hourly cap=%s, Daily cap=%s. Active days=%s hours=%s. AMD=%s(%s/%ss), Recording=%s(%s). FROM pool size=%s",
-        _MIN_INTERVAL_S, _MAX_INTERVAL_S, _HOURLY_MAX_PER_DEST, _DAILY_MAX_PER_DEST, ",".join(_ACTIVE_DAYS), _ACTIVE_HOURS_LOCAL,
-        "on" if _ENABLE_AMD else "off", _AMD_MODE, _AMD_TIMEOUT_S,
-        "on" if _recording_enabled() else "off", _RECORDING_CHANNELS, len(_FROM_NUMBERS)
+def _init_user_messages() -> None:
+    global _USER_MESSAGES
+    with _USER_MESSAGES_LOCK:
+        _USER_MESSAGES = _load_user_messages_from_disk()
+    if _USER_MESSAGES:
+        log.info("Loaded %s user messages from disk.", len(_USER_MESSAGES))
+    else:
+        log.info("No user messages configured; using built-in dialogs.")
+
+
+_init_user_messages()
+
+
+@app.route("/api/messages", methods=["GET"])
+def api_messages_get():
+    with _USER_MESSAGES_LOCK:
+        msgs = list(_USER_MESSAGES)
+    return jsonify({"messages": msgs})
+
+
+@app.route("/api/messages", methods=["POST"])
+def api_messages_post():
+    try:
+        data = request.get_json(force=True, silent=False) or {}
+    except Exception:
+        data = {}
+    items = data.get("messages")
+    if not isinstance(items, list):
+        return Response("Invalid payload.", status=400)
+    cleaned: List[str] = []
+    for s in items:
+        if not isinstance(s, str):
+            continue
+        t = s.strip()
+        if not t:
+            continue
+        cleaned.append(t)
+        if len(cleaned) >= 10:
+            break
+    with _USER_MESSAGES_LOCK:
+        global _USER_MESSAGES
+        _USER_MESSAGES = cleaned
+    _persist_user_messages_to_disk(cleaned)
+    return jsonify(ok=True, messages=cleaned)
+
+
+def _pick_user_message() -> Optional[str]:
+    with _USER_MESSAGES_LOCK:
+        if not _USER_MESSAGES:
+            return None
+        return random.choice(_USER_MESSAGES)
+
+
+def _say_with_prosody(vr: VoiceResponse, text: str, voice: str, language: str) -> None:
+    """
+    Attempt to apply SSML prosody controls if a Polly voice is selected.
+    Falls back to plain <Say> on any error.
+    """
+    text = text or ""
+    try:
+        if voice.startswith("Polly.") and (  # SSML prosody is supported with Polly voices
+            _runtime.tts_rate_percent != 100 or _runtime.tts_pitch_semitones != 0 or _runtime.tts_volume_db != 0
+        ):
+            rate = f"{_runtime.tts_rate_percent}%"
+            pitch_sign = "+" if _runtime.tts_pitch_semitones >= 0 else ""
+            pitch = f"{pitch_sign}{_runtime.tts_pitch_semitones}st"
+            vol_sign = "+" if _runtime.tts_volume_db >= 0 else ""
+            volume = f"{vol_sign}{_runtime.tts_volume_db}dB"
+            ssml = f"<speak><prosody rate='{rate}' pitch='{pitch}' volume='{volume}'>{_xml_escape(text)}</prosody></speak>"
+            vr.say(ssml, voice=voice, language=language)
+            return
+        # Fallback to plain <Say>
+        vr.say(text, voice=voice, language=language)
+    except Exception as e:
+        log.warning("SSML say failed; falling back to plain say: %s", e)
+        vr.say(text, voice=voice, language=language)
+
+
+def _build_opening_lines_for_sid(call_sid: str) -> List[str]:
+    one = _pop_one_shot_opening()
+    if one:
+        lines = [one]
+    else:
+        pick = _pick_user_message()
+        if pick:
+            lines = [pick]
+        else:
+            params = _get_params_for_sid(call_sid)
+            base_dialog = _get_dialog_lines(params.dialog_idx)
+            first = base_dialog[0] if base_dialog else "Hello."
+            lines = [first]
+    if _runtime.company_name:
+        lines.append(f"This is {_runtime.company_name}.")
+    if _runtime.topic:
+        lines.append(f"I am calling about {_runtime.topic}.")
+    log.info("Opening lines prepared for %s: count=%s", _mask_sid(call_sid), len(lines))
+    return [ln for ln in lines if ln]
+
+
+# Twilio voice routes
+@app.route("/voice", methods=["POST", "GET"])
+def voice_entrypoint():
+    if VoiceResponse is None:
+        log.error("Server missing Twilio TwiML library.")
+        return Response("Server missing Twilio TwiML library.", status=500)
+    vr = VoiceResponse()
+
+    call_sid = request.values.get("CallSid", "") or None
+    log.info(
+        "ENTRY /voice: CallSid=%s, To=%s, From=%s, Method=%s",
+        _mask_sid(call_sid),
+        _mask_phone(request.values.get("To") or _runtime.to_number),
+        _mask_phone(request.values.get("From")),
+        request.method,
+    )
+    if call_sid:
+        _set_current_call_sid(call_sid)
+        _clear_outgoing_pending()
+        _assign_params_to_sid(call_sid)
+        _init_call_meta_if_absent(
+            call_sid,
+            to=(request.values.get("To") or _runtime.to_number or ""),
+            from_n=(request.values.get("From") or ""),
+            started_at=int(time.time()),
+        )
+
+    # ============================================================================
+    # Media Streams setup (for live audio listening feature)
+    # ============================================================================
+    if _runtime.enable_media_streams and Start is not None and Stream is not None and _runtime.public_base_url:
+        try:
+            start = Start()
+            ws_base = _runtime.public_base_url.replace("http:", "ws:").replace("https:", "wss:")
+            
+            # Always attach inbound stream (lets you hear the caller)
+            start.stream(url=f"{ws_base}/media-in", track="inbound_track")
+            inbound_attached = True
+            
+            # Only attach outbound stream if explicitly enabled (saves bandwidth)
+            outbound_attached = False
+            if _runtime.stream_outbound_audio:
+                start.stream(url=f"{ws_base}/media-out", track="outbound_track")
+                outbound_attached = True
+            
+            vr.append(start)
+            
+            # Safety logging to make debugging easier
+            log.info(
+                "Attached media streams inbound=%s outbound=%s (CallSid=%s)",
+                inbound_attached,
+                outbound_attached,
+                _mask_sid(call_sid)
+            )
+        except Exception as e:
+            log.warning("Failed to attach media streams: %s", e)
+    else:
+        # Log why media streams weren't attached (helps troubleshooting)
+        reasons = []
+        if not _runtime.enable_media_streams:
+            reasons.append("ENABLE_MEDIA_STREAMS=false")
+        if Start is None or Stream is None:
+            reasons.append("TwiML classes unavailable")
+        if not _runtime.public_base_url:
+            reasons.append("PUBLIC_BASE_URL not set")
+        
+        if reasons:
+            log.debug("Media streams not attached: %s (CallSid=%s)", ", ".join(reasons), _mask_sid(call_sid))
+
+    g = Gather(
+        input="speech",
+        method="POST",
+        action=url_for("hello_got_speech", _external=True),
+        timeout=str(_runtime.callee_silence_hangup_seconds),
+        speech_timeout="auto",
+        barge_in=False,
+        partial_result_callback=url_for("transcribe_partial", stage="hello", seq=0, _external=True),
+        partial_result_callback_method="POST",
+        language=_runtime.tts_language,
+    )
+    vr.append(g)
+    vr.redirect(url_for("hello_got_speech", _external=True), method="POST")
+    return Response(str(vr), status=200, mimetype="text/xml")
+
+
+@app.route("/hello", methods=["POST"])
+def hello_got_speech():
+    if VoiceResponse is None:
+        log.error("Server missing Twilio TwiML library.")
+        return Response("Server missing Twilio TwiML library.", status=500)
+    vr = VoiceResponse()
+
+    call_sid = request.values.get("CallSid", "") or ""
+    log.info("ENTRY /hello: CallSid=%s", _mask_sid(call_sid))
+    if call_sid:
+        _set_current_call_sid(call_sid)
+        _clear_outgoing_pending()
+        _assign_params_to_sid(call_sid)
+        _init_call_meta_if_absent(
+            call_sid,
+            to=(request.values.get("To") or _runtime.to_number or ""),
+            from_n=(request.values.get("From") or ""),
+            started_at=int(time.time()),
+        )
+
+    speech_text = (request.values.get("SpeechResult") or "").strip()
+    log.info("Hello stage SpeechResult present=%s, len=%s", bool(speech_text), len(speech_text))
+    if speech_text:
+        _append_transcript(call_sid, "Callee", speech_text, is_final=True)
+
+    params = _get_params_for_sid(call_sid)
+    opening_lines = _build_opening_lines_for_sid(call_sid)
+    for i, line in enumerate(opening_lines):
+        _append_transcript(call_sid, "Assistant", line, is_final=True)
+        _say_with_prosody(vr, line, voice=params.voice, language=_runtime.tts_language)
+        if i < len(opening_lines) - 1 and _runtime.greeting_pause_seconds > 0:
+            vr.pause(length=_runtime.greeting_pause_seconds)
+
+    g = Gather(
+        input="speech",
+        method="POST",
+        action=url_for("dialog", turn=1, _external=True),
+        timeout=str(_runtime.callee_silence_hangup_seconds),
+        speech_timeout="auto",
+        barge_in=True,
+        partial_result_callback=url_for("transcribe_partial", stage="dialog", seq=1, _external=True),
+        partial_result_callback_method="POST",
+        language=_runtime.tts_language,
+    )
+    vr.append(g)
+    _say_with_prosody(vr, "Goodbye.", voice=params.voice, language=_runtime.tts_language)
+    vr.hangup()
+    return Response(str(vr), status=200, mimetype="text/xml")
+
+
+@app.route("/dialog", methods=["POST"])
+def dialog():
+    if VoiceResponse is None:
+        log.error("Server missing Twilio TwiML library.")
+        return Response("Server missing Twilio TwiML library.", status=500)
+    vr = VoiceResponse()
+
+    call_sid = request.values.get("CallSid", "") or ""
+    turn = _parse_int(request.args.get("turn"), 1)
+    log.info("ENTRY /dialog: CallSid=%s, turn=%s", _mask_sid(call_sid), turn)
+
+    _set_current_call_sid(call_sid or _get_current_call_sid())
+
+    speech_text = (request.values.get("SpeechResult") or "").strip()
+    log.info("Dialog SpeechResult present=%s, len=%s", bool(speech_text), len(speech_text))
+    if speech_text:
+        _append_transcript(call_sid, "Callee", speech_text, is_final=True)
+
+    # Optional pause before the assistant responds (timing config)
+    if _runtime.response_pause_seconds > 0:
+        try:
+            vr.pause(length=_runtime.response_pause_seconds)
+        except Exception:
+            pass
+
+    params = _get_params_for_sid(call_sid)
+    reply_lines = _compose_assistant_reply(call_sid, turn)
+    log.info("Assistant reply line count=%s", len(reply_lines))
+    for i, line in enumerate(reply_lines):
+        _append_transcript(call_sid, "Assistant", line, is_final=True)
+        _say_with_prosody(vr, line, voice=params.voice, language=_runtime.tts_language)
+        if i < len(reply_lines) - 1 and _runtime.between_phrases_pause_seconds > 0:
+            vr.pause(length=_runtime.between_phrases_pause_seconds)
+
+    if turn < _runtime.max_dialog_turns:
+        next_turn = turn + 1
+        g = Gather(
+            input="speech",
+            method="POST",
+            action=url_for("dialog", turn=next_turn, _external=True),
+            timeout=str(_runtime.callee_silence_hangup_seconds),
+            speech_timeout="auto",
+            barge_in=True,
+            partial_result_callback=url_for("transcribe_partial", stage="dialog", seq=next_turn, _external=True),
+            partial_result_callback_method="POST",
+            language=_runtime.tts_language,
+        )
+        vr.append(g)
+        _say_with_prosody(vr, "Goodbye.", voice=params.voice, language=_runtime.tts_language)
+        vr.hangup()
+    else:
+        _say_with_prosody(vr, "Goodbye.", voice=params.voice, language=_runtime.tts_language)
+        vr.hangup()
+
+    return Response(str(vr), status=200, mimetype="text/xml")
+
+
+@app.route("/transcribe-partial", methods=["POST"])
+def transcribe_partial():
+    call_sid = request.values.get("CallSid", "") or ""
+    stage = request.args.get("stage") or "unknown"
+    seq = request.args.get("seq") or ""
+    _set_current_call_sid(call_sid or _get_current_call_sid())
+    part = (request.values.get("UnstableSpeechResult") or request.values.get("SpeechResult") or "").strip()
+    log.debug("Partial transcription: stage=%s seq=%s sid=%s present=%s len=%s", stage, seq, _mask_sid(call_sid), bool(part), len(part))
+    if part:
+        _append_transcript(call_sid, "Callee", part, is_final=False)
+    return ("", 204)
+
+
+@app.route("/status", methods=["POST"])
+def status_callback():
+    call_sid = request.values.get("CallSid", "") or ""
+    call_status = (request.values.get("CallStatus") or "").lower()
+    answered_by = request.values.get("AnsweredBy") or ""
+    sip_code = request.values.get("SipResponseCode") or ""
+    duration = request.values.get("CallDuration") or ""
+    to_n = request.values.get("To") or ""
+    from_n = request.values.get("From") or ""
+
+    log.info(
+        "Twilio status: sid=%s status=%s answered_by=%s sip=%s duration=%s to=%s from=%s",
+        _mask_sid(call_sid),
+        call_status,
+        answered_by,
+        sip_code,
+        duration,
+        _mask_phone(to_n),
+        _mask_phone(from_n),
     )
 
-    calls_made = 0
-    while not _STOP_REQUESTED:
-        if _manual_call_requested.is_set():
-            _manual_call_requested.clear()
-            logging.info("Processing manual 'Call now' request.")
+    now = int(time.time())
 
-        now_dt = _now_local()
+    if call_status in ("initiated", "ringing", "in-progress", "answered"):
+        if call_sid:
+            _set_current_call_sid(call_sid)
+            _init_call_meta_if_absent(call_sid, to=to_n, from_n=from_n, started_at=now)
+        _clear_outgoing_pending()
+        _clear_last_dial_error()
 
-        wait_active = _time_until_active_window(now_dt)
-        if wait_active > 0:
-            now_ts = int(time.time())
-            _next_call_start_epoch_s = now_ts
-            _next_call_epoch_s = now_ts + wait_active
-            logging.info("Outside active window. Sleeping %ss until next window.", wait_active)
-            if _sleep_with_manual_wake(wait_active):
-                continue
+    if call_status == "completed":
+        _set_current_call_sid(None)
+        _clear_outgoing_pending()
+        dur_i = _parse_int(duration, 0)
+        with _CALL_META_LOCK:
+            meta = _CALL_META.setdefault(call_sid, {})
+            meta["completed_at"] = now
+            meta["duration_seconds"] = dur_i
+            cp = _CALL_PARAMS_BY_SID.get(call_sid)
+            if cp:
+                meta["voice"] = cp.voice
+                meta["dialog_idx"] = cp.dialog_idx
+        _persist_call_history(call_sid)
+        with _TRANSCRIPTS_LOCK:
+            _TRANSCRIPTS.pop(call_sid, None)
+        _reset_schedule_after_completion(now)
+
+    return ("", 204)
+
+
+@app.route("/recording-status", methods=["POST"])
+def recording_status():
+    call_sid = request.values.get("CallSid", "") or ""
+    rec_sid = request.values.get("RecordingSid", "") or ""
+    status = (request.values.get("RecordingStatus") or "").lower()
+    log.info("Recording status: call=%s rec=%s status=%s", _mask_sid(call_sid), rec_sid, status)
+    if call_sid and rec_sid:
+        with _CALL_META_LOCK:
+            meta = _CALL_META.setdefault(call_sid, {})
+            recs = meta.setdefault("recordings", [])
+            if status in ("in-progress", "completed"):
+                if not any(r.get("recording_sid") == rec_sid for r in recs):
+                    recs.append({"recording_sid": rec_sid, "status": status})
             else:
-                continue
+                for r in recs:
+                    if r.get("recording_sid") == rec_sid:
+                        r["status"] = status
+                        break
+    return ("", 204)
 
-        allowed, wait_caps = _can_attempt(time.time(), to_number)
-        if not allowed:
-            now_ts = int(time.time())
-            _next_call_start_epoch_s = now_ts
-            _next_call_epoch_s = now_ts + wait_caps
-            logging.info("Attempt caps/backoff prevent calling now. Sleeping %ss.", wait_caps)
-            if _sleep_with_manual_wake(wait_caps):
-                continue
-            else:
-                continue
 
-        # Randomized interval for the next attempt after this call
-        interval_chosen = random.randint(_MIN_INTERVAL_S, _MAX_INTERVAL_S)
+# Media Streams bridge to browser
+if Sock is not None:
+    _sock = Sock(app)
+else:
+    _sock = None
 
-        # Always choose a random FROM number when a pool is provided
-        from_number = _select_from_number_random()
-        _last_from_number = from_number
+_AUDIO_CLIENTS_LOCK = threading.Lock()
+_AUDIO_CLIENTS: Set[Any] = set()
 
-        msg_url = f"{public_base_url}/voice"
 
+def _broadcast_audio(payload_b64: str) -> None:
+    if not payload_b64:
+        return
+    with _AUDIO_CLIENTS_LOCK:
+        clients = list(_AUDIO_CLIENTS)
+    drop_count = 0
+    for ws in clients:
         try:
-            _ = place_call(_TWILIO_CLIENT, url=msg_url, from_number=from_number, to_number=to_number, interval_chosen_s=interval_chosen, backoff_wait_s=0)
-        except TwilioRestException as e:
-            logging.error("Twilio API error placing call (status %s, code %s): %s", getattr(e, "status", None), getattr(e, "code", None), str(e))
-            wait_err = min(180, max(30, _MIN_INTERVAL_S // 2))
-            now_ts = int(time.time())
-            _next_call_start_epoch_s = now_ts
-            _next_call_epoch_s = now_ts + wait_err
-            logging.info("Retrying after %ss due to Twilio API error.", wait_err)
-            if _sleep_with_manual_wake(wait_err):
-                continue
-            continue
-        except Exception as e:
-            is_requests_err = requests is not None and isinstance(e, requests.exceptions.RequestException)
-            if is_requests_err or "Temporary failure in name resolution" in str(e):
-                logging.error("Network error placing call (likely transient): %s", str(e))
-                wait_err = min(180, max(30, _MIN_INTERVAL_S // 2))
-                now_ts = int(time.time())
-                _next_call_start_epoch_s = now_ts
-                _next_call_epoch_s = now_ts + wait_err
-                logging.info("Retrying after %ss due to network error.", wait_err)
-                if _sleep_with_manual_wake(wait_err):
+            ws.send(payload_b64)
+        except Exception:
+            drop_count += 1
+            try:
+                with _AUDIO_CLIENTS_LOCK:
+                    _AUDIO_CLIENTS.discard(ws)
+            except Exception:
+                pass
+    if drop_count:
+        log.info("Cleaned up %s disconnected audio clients.", drop_count)
+
+
+if _sock is not None:
+    @_sock.route("/media-in")
+    def media_in(ws):  # type: ignore
+        log.info("WebSocket connected: /media-in")
+        try:
+            while True:
+                msg = ws.receive()
+                if msg is None:
+                    break
+                try:
+                    data = json.loads(msg)
+                except Exception:
                     continue
-                continue
-            logging.exception("Unexpected error placing call: %s", str(e))
-            wait_err = 60
-            now_ts = int(time.time())
-            _next_call_start_epoch_s = now_ts
-            _next_call_epoch_s = now_ts + wait_err
-            if _sleep_with_manual_wake(wait_err):
-                continue
-            continue
+                if data.get("event") == "media":
+                    payload = data.get("media", {}).get("payload", "")
+                    if payload:
+                        _broadcast_audio(payload)
+        except Exception as e:
+            log.warning("WebSocket /media-in closed with error: %s", e)
+        finally:
+            log.info("WebSocket disconnected: /media-in")
 
+    @_sock.route("/media-out")
+    def media_out(ws):  # type: ignore
+        log.info("WebSocket connected: /media-out")
+        try:
+            while True:
+                msg = ws.receive()
+                if msg is None:
+                    break
+        except Exception as e:
+            log.warning("WebSocket /media-out closed with error: %s", e)
+        finally:
+            log.info("WebSocket disconnected: /media-out")
+
+    @_sock.route("/client-audio")
+    def client_audio(ws):  # type: ignore
+        with _AUDIO_CLIENTS_LOCK:
+            _AUDIO_CLIENTS.add(ws)
+        log.info("WebSocket client connected: /client-audio (clients=%s)", len(_AUDIO_CLIENTS))
+        try:
+            while True:
+                msg = ws.receive()
+                if msg is None:
+                    break
+        except Exception as e:
+            log.warning("WebSocket /client-audio closed with error: %s", e)
+        finally:
+            with _AUDIO_CLIENTS_LOCK:
+                _AUDIO_CLIENTS.discard(ws)
+            log.info("WebSocket client disconnected: /client-audio (clients=%s)", len(_AUDIO_CLIENTS))
+
+
+# Ngrok management
+_active_tunnel_url: Optional[str] = None
+
+
+def _start_ngrok_if_enabled() -> None:
+    global _active_tunnel_url
+    if not _runtime.use_ngrok:
+        log.info("Ngrok disabled (USE_NGROK=false).")
+        return
+    if ngrok_lib is None:
+        log.warning("USE_NGROK=true but pyngrok is not installed. Skipping.")
+        return
+    try:
+        if _active_tunnel_url:
+            log.info("Ngrok already active at %s", _active_tunnel_url)
+            return
+        port = _runtime.flask_port or 8080
+        tun = ngrok_lib.connect(addr=port, proto="http")
+        _active_tunnel_url = tun.public_url  # type: ignore
+        os.environ["PUBLIC_BASE_URL"] = _active_tunnel_url
+        _runtime.public_base_url = _active_tunnel_url
+        log.info("ngrok tunnel active at %s", _active_tunnel_url)
+    except Exception as e:
+        log.error("Failed to start ngrok: %s", e)
+
+
+@atexit.register
+def _shutdown_ngrok():
+    try:
+        if ngrok_lib is not None:
+            ngrok_lib.kill()
+            log.info("ngrok terminated at exit.")
+    except Exception:
+        pass
+
+
+def _handle_termination(signum, frame):
+    log.info("Termination signal received (%s). Stopping service.", signum)
+    try:
+        _stop_requested.set()
+    except Exception:
+        pass
+    try:
+        time.sleep(0.5)
+    except Exception:
+        pass
+    raise SystemExit(0)
+
+
+signal.signal(signal.SIGTERM, _handle_termination)
+signal.signal(signal.SIGINT, _handle_termination)
+
+
+def _start_background_threads() -> None:
+    global _dialer_thread
+    if _dialer_thread is None or not _dialer_thread.is_alive():
+        _dialer_thread = threading.Thread(target=_dialer_loop, name="dialer-thread", daemon=True)
+        _dialer_thread.start()
+        log.info("Background dialer thread started.")
+
+
+@app.route("/api/call-now", methods=["POST"])
+def api_call_now():
+    log.info("POST /api/call-now received.")
+    ready, reasons = _diagnostics_ready_to_call()
+    if not ready:
+        log.error("Call-now rejected; not ready: %s", reasons)
+        return jsonify(ok=False, reason="not_ready", message="Service not ready for outbound calls.", reasons=reasons), 400
+
+    direct = _parse_bool(os.environ.get("DIRECT_DIAL_ON_TRIGGER"), True)
+
+    if not _within_active_window(_now_local()):
+        msg = "Outside active calling window."
+        log.info("Call-now inside=%s -> %s", False, msg)
+        return jsonify(ok=False, reason="outside_active_window", message=msg), 200
+    if not _runtime.to_number:
+        log.info("Call-now missing destination TO_NUMBER.")
+        return jsonify(ok=False, reason="missing_destination", message="TO_NUMBER is not configured."), 400
+
+    if _get_current_call_sid() is not None:
+        log.info("Call-now suppressed; call already in progress.")
+        return jsonify(ok=False, reason="already_in_progress", message="A call is already in progress."), 409
+    if _is_outgoing_pending():
+        log.info("Call-now suppressed; outgoing pending in effect.")
+        return jsonify(ok=False, reason="pending", message="A call request is already pending."), 409
+
+    now = int(time.time())
+    allowed, wait_s = _can_attempt(now, _runtime.to_number)
+    if not allowed:
+        log.info("Call-now capped; wait %s seconds.", wait_s)
+        return jsonify(ok=False, reason="cap_reached", wait_seconds=wait_s), 429
+
+    if direct:
+        log.info("Call-now taking direct path (DIRECT_DIAL_ON_TRIGGER=true).")
+        _log_dialer_gates("direct_call_now")
+        ok = _place_call_now()
+        log.info("Direct call-now place_call_now result=%s", ok)
+        if ok:
+            return jsonify(ok=True, started=True)
+        with _LAST_DIAL_ERROR_LOCK:
+            err = _LAST_DIAL_ERROR.get("message") if _LAST_DIAL_ERROR else "Twilio call placement failed; see server logs."
+        return jsonify(ok=False, reason="twilio_error", message=err), 502
+
+    _mark_outgoing_pending()
+    _manual_call_requested.set()
+    log.info("Call-now accepted; manual request queued.")
+    return jsonify(ok=True, queued=True)
+
+
+# New: API endpoint the frontend expects for status display
+@app.route("/api/status", methods=["GET"])
+def api_status():
+    """
+    Return JSON describing current scheduler state, caps, next attempt countdown,
+    whether we are within the active calling window, and any recent placement error.
+    This endpoint is polled by the frontend.
+    """
+    now = int(time.time())
+    # seconds until next scheduled attempt and interval total
+    with _next_call_epoch_s_lock:
+        seconds_until_next = int(max(0, _next_call_epoch_s - now)) if _next_call_epoch_s is not None else None
+        interval_total = int(_interval_total_seconds) if _interval_total_seconds is not None else None
+
+    # attempts counts for the current to_number (last hour and last day)
+    attempts_last_hour = 0
+    attempts_last_day = 0
+    if _runtime.to_number:
         with _attempts_lock:
-            _dest_attempts.setdefault(to_number, []).append(time.time())
-        calls_made += 1
+            lst = list(_dest_attempts.get(_runtime.to_number, []))
+        cutoff_h = now - 3600
+        cutoff_d = now - 24 * 3600
+        attempts_last_hour = sum(1 for t in lst if t >= cutoff_h)
+        attempts_last_day = sum(1 for t in lst if t >= cutoff_d)
 
-        now_ts = int(time.time())
-        _next_call_start_epoch_s = now_ts
-        _next_call_epoch_s = now_ts + interval_chosen
+    # can attempt now and wait seconds if capped
+    can_attempt_now = True
+    wait_seconds_if_capped = 0
+    if _runtime.to_number:
+        can_attempt_now, wait_seconds_if_capped = _can_attempt(now, _runtime.to_number)
 
-        if _sleep_with_manual_wake(interval_chosen):
-            continue
+    # whether a call is currently in progress
+    call_sid = _get_current_call_sid()
+    call_in_progress = bool(call_sid)
 
-    logging.info("Stopped. Total calls attempted: %s", calls_made)
-    return 0
+    # within active hours/gate
+    within_active = _within_active_window(_now_local())
+
+    # last error
+    last_err = None
+    with _LAST_DIAL_ERROR_LOCK:
+        if _LAST_DIAL_ERROR:
+            last_err = dict(_LAST_DIAL_ERROR)
+
+    payload = {
+        "call_in_progress": call_in_progress,
+        "call_sid": call_sid or "",
+        "within_active_window": within_active,
+        "seconds_until_next": seconds_until_next if seconds_until_next is not None else None,
+        "interval_total_seconds": interval_total if interval_total is not None else None,
+        "attempts_last_hour": attempts_last_hour,
+        "attempts_last_day": attempts_last_day,
+        "hourly_max_attempts": _runtime.hourly_max_attempts,
+        "daily_max_attempts": _runtime.daily_max_attempts,
+        "can_attempt_now": bool(can_attempt_now),
+        "wait_seconds_if_capped": int(wait_seconds_if_capped) if wait_seconds_if_capped else 0,
+        "to_number": _runtime.to_number or "",
+        "from_number": _runtime.from_number or "",
+        "from_numbers": list(_runtime.from_numbers or []),
+        "public_base_url": _runtime.public_base_url or "",
+        "active_hours_local": _runtime.active_hours_local or "",
+        "last_error": last_err,
+    }
+    return jsonify(payload)
 
 
-@app.route("/greet", methods=["POST"])
-def greet_handler_legacy() -> Response:
-    call_sid = request.form.get("CallSid", "")
-    speech_text = request.form.get("SpeechResult", "") or ""
-    if speech_text:
-        _append_callee_line(call_sid, speech_text)
-    return wait_for_callee_handler()
+# New: Live transcript and live call info endpoint the frontend polls
+@app.route("/api/live", methods=["GET"])
+def api_live():
+    """
+    Return current live transcript (merged finals plus latest partial) and whether media streams are enabled.
+    The frontend uses this for the live conversation panel and to enable the Listen button.
+    """
+    call_sid = _get_current_call_sid()
+    in_progress = bool(call_sid)
+    with _TRANSCRIPTS_LOCK:
+        transcript = list(_TRANSCRIPTS.get(call_sid, [])) if call_sid else []
+    return jsonify({
+        "in_progress": in_progress,
+        "call_sid": call_sid or "",
+        "media_streams_enabled": bool(_runtime.enable_media_streams),
+        "transcript": transcript,
+    })
+
+
+# New: History endpoints (used by history UI and to compute metrics)
+@app.route("/api/history", methods=["GET"])
+def api_history():
+    try:
+        calls = _scan_history_summaries(limit=1000)
+        return jsonify({"calls": calls})
+    except Exception:
+        return jsonify({"calls": []})
+
+
+@app.route("/api/history/<sid>", methods=["GET"])
+def api_history_get(sid: str):
+    d = _load_call_history(sid)
+    if not d:
+        return Response("Not found", status=404)
+    return jsonify(d)
+
+
+# New: Metrics endpoint used to drive summary graphics (total calls, total call time)
+@app.route("/api/metrics", methods=["GET"])
+def api_metrics():
+    try:
+        metrics = _compute_history_metrics()
+        return jsonify(metrics)
+    except Exception as e:
+        log.exception("Failed computing metrics: %s", e)
+        return jsonify({"total_calls": 0, "total_duration_seconds": 0, "average_call_seconds": 0})
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify(ok=True, ts=int(time.time()))
+
+
+def main():
+    # Initialize SQLite database
+    init_database()
+    
+    log.info("Scam Call Console starting.")
+    acc = os.environ.get("TWILIO_ACCOUNT_SID", "")
+    if acc:
+        log.info("Twilio Account SID present (masked): %s", _mask_sid(acc))
+    _log_runtime_summary(context="startup")
+    _start_ngrok_if_enabled()
+    _start_background_threads()
+    
+    host = _runtime.flask_host or os.environ.get("FLASK_HOST", "0.0.0.0")
+    port = int(_runtime.flask_port or _parse_int(os.environ.get("FLASK_PORT"), 8080))
+    debug = bool(_runtime.flask_debug or _parse_bool(os.environ.get("FLASK_DEBUG"), False))
+    
+    # ============================================================================
+    # Hypercorn ASGI server support (better for WebSocket media streams)
+    # ============================================================================
+    if _runtime.use_hypercorn:
+        try:
+            # Try to import and use Hypercorn for proper WebSocket support
+            from hypercorn.asyncio import serve  # type: ignore
+            from hypercorn.config import Config  # type: ignore
+            
+            config = Config()
+            config.bind = [f"{host}:{port}"]
+            # Keep reasonably short timeouts for responsiveness
+            config.keep_alive_timeout = 5
+            config.graceful_timeout = 10
+            
+            log.info("Starting Hypercorn ASGI server on %s:%s (WebSocket support enabled)", host, port)
+            log.info("Note: This enables proper 101 WebSocket upgrades needed for Twilio Media Streams")
+            
+            # Run the ASGI server
+            asyncio.run(serve(app, config))
+            
+        except ImportError:
+            log.warning("Hypercorn not available (pip3 install hypercorn), falling back to Flask dev server")
+            log.warning("WARNING: Flask dev server doesn't support WebSocket upgrades - media streams may not work!")
+            app.run(host=host, port=port, debug=debug, use_reloader=False)
+        except Exception as e:
+            log.error("Failed to start Hypercorn: %s", e)
+            log.warning("Falling back to Flask dev server (WebSocket upgrades may not work)")
+            app.run(host=host, port=port, debug=debug, use_reloader=False)
+    else:
+        # Standard Flask development server (fine for testing, but no WebSocket upgrades)
+        log.info("Starting Flask dev server on %s:%s (debug=%s)", host, port, debug)
+        if _runtime.enable_media_streams:
+            log.warning("Media streams enabled but using Flask dev server - WebSocket upgrades may fail!")
+            log.warning("Consider setting USE_HYPERCORN=true for proper WebSocket support")
+        app.run(host=host, port=port, debug=debug, use_reloader=False)
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()
+

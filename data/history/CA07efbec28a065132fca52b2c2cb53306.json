@@ -1,0 +1,32 @@
+{
+  "sid": "CA07efbec28a065132fca52b2c2cb53306",
+  "meta": {
+    "to": "+18319460285",
+    "from_n": "+19162487450",
+    "started_at": 1755273437,
+    "completed_at": 1755273451,
+    "duration_seconds": 13,
+    "voice": "man",
+    "dialog_idx": 2
+  },
+  "transcript": [
+    {
+      "t": 1755273446.2088344,
+      "role": "Callee",
+      "text": "Hello.",
+      "final": false
+    },
+    {
+      "t": 1755273446.7807348,
+      "role": "Callee",
+      "text": "Hello.",
+      "final": false
+    },
+    {
+      "t": 1755273449.2284906,
+      "role": "Callee",
+      "text": "Hello.",
+      "final": true
+    }
+  ]
+}

@@ -1,0 +1,178 @@
+/* Accessibility and scrolling overrides for Scam Call App
+   - Restores default page scrolling
+   - Improves button contrast/visibility
+   - Safe to load last to override prior styles
+   - No slang, production style
+*/
+
+/* 1) Global scroll fixes */
+html, body {
+  /* Ensure the document can scroll vertically unless an explicit page-level container takes over */
+  min-height: 100%;
+  height: auto;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch; /* iOS smooth scrolling */
+}
+
+/* If any global modal logic added a persistent lock, ensure it does not apply by default */
+html.no-scroll, body.no-scroll,
+html.modal-open, body.modal-open {
+  /* Many modal libs toggle these; keep them available but avoid accidental global locks */
+  overflow-y: auto !important;
+}
+
+/* Common page containers: make sure they can scroll if they grow */
+main, .app, #app, .page, .page-content, .content, .container, .wrapper {
+  min-height: 100%;
+}
+
+/* Utility for any container meant to scroll internally */
+[data-scrollable="page"], .scrollable-page {
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+/* 2) Color tokens (dark theme defaults) */
+:root {
+  --surface-0: #0b1220;
+  --surface-1: #0f172a;
+  --surface-2: #111827;
+
+  --text-strong: #e5e7eb;
+  --text-muted: #cbd5e1;
+
+  /* Brand accents – tuned for contrast on dark backgrounds */
+  --brand-600: #06b6d4; /* cyan-500/600ish */
+  --brand-700: #0891b2;
+  --brand-800: #0e7490;
+
+  /* Subtle glass effect (kept modest for readability) */
+  --btn-glass: rgba(255, 255, 255, 0.06);
+  --btn-border: rgba(255, 255, 255, 0.18);
+
+  /* Focus ring */
+  --focus-ring: rgba(6, 182, 212, 0.55);
+  --focus-ring-strong: rgba(6, 182, 212, 0.75);
+}
+
+/* 3) High-contrast button baseline
+   This targets common button selectors used across stacks.
+   It replaces very low-contrast “ghost” styles with accessible ones.
+*/
+button,
+.btn,
+.button,
+[role="button"],
+.btn-ghost,
+.button-ghost,
+[data-variant="ghost"],
+[data-variant="subtle"] {
+  appearance: none;
+  -webkit-appearance: none;
+  background: linear-gradient(
+      180deg,
+      rgba(255, 255, 255, 0.06) 0%,
+      rgba(0, 0, 0, 0.08) 100%
+    ),
+    var(--brand-700);
+  color: var(--text-strong);
+  border: 1px solid var(--brand-800);
+  border-radius: 12px;
+  padding: 0.625rem 1rem;
+  line-height: 1.2;
+  font-weight: 600;
+  box-shadow:
+    0 1px 0 0 rgba(255, 255, 255, 0.05) inset,
+    0 6px 16px rgba(0, 0, 0, 0.25);
+  transition:
+    background-color 120ms ease,
+    box-shadow 120ms ease,
+    transform 60ms ease;
+  backdrop-filter: saturate(120%) blur(0.5px);
+}
+
+/* Hover/active states for better affordance */
+button:hover,
+.btn:hover,
+.button:hover,
+[role="button"]:hover,
+.btn-ghost:hover,
+.button-ghost:hover,
+[data-variant="ghost"]:hover,
+[data-variant="subtle"]:hover {
+  background: linear-gradient(
+      180deg,
+      rgba(255, 255, 255, 0.10) 0%,
+      rgba(0, 0, 0, 0.10) 100%
+    ),
+    var(--brand-600);
+  box-shadow:
+    0 1px 0 0 rgba(255, 255, 255, 0.06) inset,
+    0 10px 20px rgba(0, 0, 0, 0.30);
+}
+
+button:active,
+.btn:active,
+.button:active,
+[role="button"]:active,
+.btn-ghost:active,
+.button-ghost:active,
+[data-variant="ghost"]:active,
+[data-variant="subtle"]:active {
+  transform: translateY(1px);
+  background: linear-gradient(
+      180deg,
+      rgba(0, 0, 0, 0.10) 0%,
+      rgba(0, 0, 0, 0.20) 100%
+    ),
+    var(--brand-700);
+  box-shadow:
+    0 0 0 rgba(0,0,0,0),
+    inset 0 1px 3px rgba(0, 0, 0, 0.25);
+}
+
+/* Disabled state with adequate contrast but clear inactivity */
+button:disabled,
+.btn:disabled,
+.button:disabled,
+[aria-disabled="true"] {
+  cursor: not-allowed;
+  opacity: 0.55;
+  filter: grayscale(8%);
+}
+
+/* Focus visibility for keyboard users */
+button:focus-visible,
+.btn:focus-visible,
+.button:focus-visible,
+[role="button"]:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+  box-shadow:
+    0 0 0 3px var(--focus-ring),
+    0 6px 16px rgba(0, 0, 0, 0.25);
+}
+
+/* 4) If you have “tab-like” buttons (e.g., in the screenshot), improve contrast there too */
+.tab,
+.tabs .tab,
+[role="tab"] {
+  background-color: var(--surface-2);
+  border: 1px solid var(--btn-border);
+  color: var(--text-strong);
+  border-radius: 10px;
+}
+
+.tab[aria-selected="true"],
+[role="tab"][aria-selected="true"] {
+  background-color: var(--brand-700);
+  border-color: var(--brand-800);
+  color: white;
+}
+
+/* 5) Respect reduced motion preferences */
+@media (prefers-reduced-motion: reduce) {
+  button, .btn, .button, [role="button"] {
+    transition: none;
+  }
+}

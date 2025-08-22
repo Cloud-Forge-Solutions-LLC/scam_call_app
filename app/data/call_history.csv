@@ -1,0 +1,3 @@
+callSid,startedAt,durationSec,outcome,transcript,prompt
+CAac4537e468cb572270c11b3b799824f3,1755132275,0,Completed with zero duration,[],Do you support verifying sensor and harness compatibility prior to shipment? || What steps do you take to avoid mismatches at install time?
+CA5c042de9b617bd6364a8b8df030c0fb5,1755132931,0,Completed with zero duration,[],"Would photos or additional documentation make this easier? || If so, what would be most useful to review first?"

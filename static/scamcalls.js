@@ -1,144 +1,165 @@
 (function () {
   "use strict";
 
-  // Utility to format seconds to mm:ss
-  function formatMMSS(totalSec) {
-    totalSec = Math.max(0, Math.floor(totalSec));
-    const m = Math.floor(totalSec / 60);
-    const s = totalSec % 60;
-    return { mStr: String(m).padStart(2, "0"), sStr: String(s).padStart(2, "0"), m, s };
+  // DOM helpers
+  const qs = (sel, ctx = document) => ctx.querySelector(sel);
+  const qsa = (sel, ctx = document) => Array.from(ctx.querySelectorAll(sel));
+
+  // Toast helper
+  function showToast(message, durationMs = 3200) {
+    const el = qs("#toast");
+    if (!el) return;
+    el.textContent = message;
+    el.classList.add("toast--show");
+    clearTimeout(showToast._t);
+    showToast._t = setTimeout(() => {
+      el.classList.remove("toast--show");
+    }, durationMs);
   }
 
-  // Smooth ring progress update
-  function updateRingProgress(el, fraction) {
-    const C = 2 * Math.PI * 54;
-    const clamped = Math.max(0, Math.min(1, fraction));
-    const offset = C * (1 - clamped);
-    el.style.strokeDasharray = `${C}`;
-    el.style.strokeDashoffset = `${offset}`;
+  // Escaping for safe HTML insertion
+  function escapeHtml(s) {
+    return (s || "").replace(/[&<>"']/g, (c) => ({
+      "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;"
+    }[c]));
   }
 
-  function wsUrl(path) {
-    const loc = window.location;
-    const proto = loc.protocol === "https:" ? "wss:" : "ws:";
-    return proto + "//" + loc.host + path;
-  }
-
-  // Mu-law decode to Float32 [-1, 1]
-  function muLawToLinear(uVal) {
-    uVal = ~uVal & 0xff;
-    const sign = (uVal & 0x80) ? -1 : 1;
-    const exponent = (uVal >> 4) & 0x07;
-    const mantissa = uVal & 0x0F;
-    let sample = ((mantissa << 4) + 0x08) << (exponent + 3);
-    sample = sign * sample;
-    return Math.max(-32768, Math.min(32767, sample)) / 32768.0;
-  }
-
-  function base64ToUint8Array(b64) {
-    const bin = atob(b64);
-    const len = bin.length;
-    const bytes = new Uint8Array(len);
-    for (let i = 0; i < len; i++) bytes[i] = bin.charCodeAt(i);
-    return bytes;
-  }
-
-  // Very simple resampler from 8000 Hz -> target sampleRate using linear interpolation.
-  function resampleLinear(float32Array, fromRate, toRate) {
-    if (fromRate === toRate) return float32Array;
-    const ratio = toRate / fromRate;
-    const outLen = Math.floor(float32Array.length * ratio);
-    const out = new Float32Array(outLen);
-    for (let i = 0; i < outLen; i++) {
-      const srcPos = i / ratio;
-      const idx = Math.floor(srcPos);
-      const frac = srcPos - idx;
-      const s0 = float32Array[idx] || 0;
-      const s1 = float32Array[idx + 1] || s0;
-      out[i] = s0 + (s1 - s0) * frac;
+  // Format seconds to mm:ss or hh:mm:ss for larger values
+  function formatDurationSeconds(totalSeconds) {
+    const s = Math.max(0, Math.floor(totalSeconds || 0));
+    const hours = Math.floor(s / 3600);
+    const minutes = Math.floor((s % 3600) / 60);
+    const seconds = s % 60;
+    if (hours > 0) {
+      return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
     }
-    return out;
+    return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
   }
 
-  class LiveAudioPlayer {
-    constructor() {
-      this.ctx = null;
-      this.queueTime = 0;
-      this.started = false;
+  // Format seconds to mm:ss (used for countdown)
+  function formatMMSS(totalSeconds) {
+    const s = Math.max(0, Math.floor(totalSeconds || 0));
+    const m = Math.floor(s / 60);
+    const r = s % 60;
+    return `${String(m).padStart(2, "0")}:${String(r).padStart(2, "0")}`;
+  }
+
+  // Build a large visual countdown ring as an SVG
+  function buildCountdownBadge(remainSec, totalSec, paused = false) {
+    const size = 168; // px
+    const stroke = 10;
+    const r = (size - stroke) / 2;
+    const c = 2 * Math.PI * r;
+
+    let pct = 0;
+    if (totalSec && totalSec > 0) {
+      const elapsed = Math.max(0, totalSec - Math.max(0, remainSec));
+      pct = Math.max(0, Math.min(1, elapsed / totalSec));
     }
+    const dash = `${(c * pct).toFixed(2)} ${c.toFixed(2)}`;
+    const ringColor = paused ? "#8892a6" : "var(--accent, #25c2a0)";
 
-    async ensureContext() {
-      if (!this.ctx) {
-        this.ctx = new (window.AudioContext || window.webkitAudioContext)();
-        this.queueTime = this.ctx.currentTime;
-      }
-      if (this.ctx.state === "suspended") {
-        await this.ctx.resume();
-      }
-    }
+    return `
+      <svg width="${size}" height="${size}" viewBox="0 0 ${size} ${size}" aria-hidden="true" style="display:block">
+        <circle cx="${size / 2}" cy="${size / 2}" r="${r}" fill="none" stroke="rgba(255,255,255,0.12)" stroke-width="${stroke}" />
+        <circle cx="${size / 2}" cy="${size / 2}" r="${r}" fill="none" stroke="${ringColor}" stroke-width="${stroke}"
+                stroke-linecap="round" stroke-dasharray="${dash}" transform="rotate(-90 ${size / 2} ${size / 2})" />
+      </svg>`;
+  }
 
-    async pushMuLawFrame(b64) {
-      await this.ensureContext();
-      const mulaw = base64ToUint8Array(b64);
-      const N = mulaw.length;
-      const pcm = new Float32Array(N);
-      for (let i = 0; i < N; i++) {
-        pcm[i] = muLawToLinear(mulaw[i]);
-      }
-      const sr = this.ctx.sampleRate;
-      const up = resampleLinear(pcm, 8000, sr);
-      const buffer = this.ctx.createBuffer(1, up.length, sr);
-      buffer.getChannelData(0).set(up);
-
-      const src = this.ctx.createBufferSource();
-      src.buffer = buffer;
-      src.connect(this.ctx.destination);
-
-      const startAt = Math.max(this.queueTime, this.ctx.currentTime + 0.05);
-      try {
-        src.start(startAt);
-      } catch {
-        // Ignore one-off scheduling errors
-        try { src.start(); } catch {}
-      }
-      this.queueTime = startAt + buffer.duration;
-      this.started = true;
-    }
-
-    async stop() {
-      if (this.ctx) {
-        try { await this.ctx.suspend(); } catch {}
-        try { await this.ctx.close(); } catch {}
-      }
-      this.ctx = null;
-      this.queueTime = 0;
-      this.started = false;
+  async function safeErrorText(res) {
+    try {
+      return await res.text();
+    } catch {
+      return "";
     }
   }
 
-  // DOM references
-  const page = document.body.getAttribute("data-page");
-  const isLivePage = page === "scamcalls";
-  const isHistoryPage = page === "history";
-
-  const state = {
-    nextCallEpochSec: null,
-    nextCallStartEpochSec: null,
-    countdownTimer: null,
-    pollTimer: null,
-    activePollTimer: null,
-    active: false,
-    callSid: null,
-    audioWs: null,
-    player: null
+  // -----------------------
+  // Greeting modal logic
+  // -----------------------
+  const greetingModal = {
+    el: null,
+    input: null,
+    wordCountEl: null,
+    saveBtn: null,
+    open() {
+      if (!this.el) return;
+      this.el.setAttribute("aria-hidden", "false");
+      this.input.focus();
+      this.updateWordCount();
+    },
+    close() {
+      if (!this.el) return;
+      this.el.setAttribute("aria-hidden", "true");
+      this.input.value = "";
+      this.updateWordCount();
+    },
+    getWordCount() {
+      const text = (this.input.value || "").trim();
+      if (!text) return 0;
+      return text.split(/\s+/).filter(Boolean).length;
+    },
+    updateWordCount() {
+      const n = this.getWordCount();
+      if (this.wordCountEl) this.wordCountEl.textContent = `${n} words`;
+      if (this.saveBtn) this.saveBtn.disabled = n < 5 || n > 15;
+    },
   };
 
-  async function apiGet(path) {
-    const resp = await fetch(path, { headers: { "Accept": "application/json" }, cache: "no-cache" });
-    if (!resp.ok) throw new Error(`HTTP ${resp.status} fetching ${path}`);
-    return resp.json();
-  }
+  function initGreetingModal() {
+    const modal = qs("#greetingModal");
+    if (!modal) return;
 
+    greetingModal.el = modal;
+    greetingModal.input = qs("#greetingInput", modal);
+    greetingModal.wordCountEl = qs("#greetingWordCount", modal);
+    greetingModal.saveBtn = qs("#greetingSaveBtn", modal);
+
+    const openBtn = qs("#btnAddGreeting");
+    const closeBtn = qs("#greetingCloseBtn");
+    const cancelBtn = qs("#greetingCancelBtn");
+    const saveBtn = qs("#greetingSaveBtn");
+
+    if (greetingModal.input) {
+      greetingModal.input.addEventListener("input", () => greetingModal.updateWordCount());
+    }
+    if (openBtn) openBtn.addEventListener("click", () => greetingModal.open());
+    if (closeBtn) closeBtn.addEventListener("click", () => greetingModal.close());
+    if (cancelBtn) cancelBtn.addEventListener("click", () => greetingModal.close());
+
+    if (saveBtn) {
+      saveBtn.addEventListener("click", async () => {
+        const phrase = (greetingModal.input.value || "").trim();
+        const words = phrase.split(/\s+/).filter(Boolean);
+        if (words.length < 5 || words.length > 15) {
+          showToast("Enter 5 to 15 words.");
+          return;
+        }
+        saveBtn.disabled = true;
+        try {
+          const res = await fetch("/api/next-greeting", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ phrase }),
+          });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok || (data && data.ok === false)) {
+            const msg = (data && data.message) || (await safeErrorText(res));
+            showToast(msg || "Failed to save greeting phrase.");
+            return;
+          }
+          showToast("Greeting phrase queued for the next call.");
+          greetingModal.close();
+        } catch (err) {
+          showToast((err && err.message) || "Failed to save greeting phrase.");
+        } finally {
+          saveBtn.disabled = false;
+        }
+      });
+    }
+  }
+  
   async function apiGet(path) {
     const resp = await fetch(path, {
       method: "GET",
@@ -165,27 +186,122 @@
       throw new Error(`HTTP ${resp.status} posting ${path}`);
     }
     return resp.json();
+=======
+  // -----------------------
+  // Call-now button wiring
+  // -----------------------
+  function initCallNow() {
+    const btn = qs("#btnCallNow");
+    if (!btn) return;
+    btn.addEventListener("click", async () => {
+      btn.disabled = true;
+      try {
+        const res = await fetch("/api/call-now", { method: "POST" });
+        const data = await res.json().catch(() => ({}));
+
+        if (res.status === 429 || (data && data.ok === false && data.reason === "cap_reached")) {
+          showToast("Maximum call attempts reached for the allotted time.");
+        } else if (!res.ok || (data && data.ok === false)) {
+          const msg = (data && data.message) || await safeErrorText(res);
+          showToast(msg || "Call request failed.");
+        } else {
+          showToast("Call attempt requested.");
+        }
+      } catch (err) {
+        showToast((err && err.message) || "Call request failed.");
+      } finally {
+        btn.disabled = false;
+      }
+    });
+
   }
 
-  function setText(id, value) {
-    const el = document.getElementById(id);
-    if (el) el.textContent = value;
+  // -----------------------
+  // Admin environment editor (matches /api/admin/env contract)
+  // -----------------------
+  async function loadEnvEditor() {
+    const container = qs("#envEditor");
+    const isAdmin = document.body.getAttribute("data-is-admin") === "1";
+    if (!container || !isAdmin) return;
+
+    const endpoint = container.getAttribute("data-endpoint-get") || "/api/admin/env";
+    container.setAttribute("aria-busy", "true");
+    try {
+      const res = await fetch(endpoint, { method: "GET", cache: "no-cache" });
+      if (!res.ok) throw new Error((await res.text()) || "Failed to load settings.");
+      const data = await res.json();
+      renderEnvTable(data.editable || []);
+    } catch (err) {
+      container.innerHTML = `<div class="alert">Error: ${escapeHtml(err.message || "Failed to load settings.")}</div>`;
+    } finally {
+      container.removeAttribute("aria-busy");
+    }
   }
 
-  function show(el) { el.classList.remove("hidden"); }
-  function hide(el) { el.classList.add("hidden"); }
+  function renderEnvTable(items) {
+    const container = qs("#envEditor");
+    if (!container) return;
+    container.innerHTML = "";
 
-  function initLivePage() {
-    const cdPanel = document.getElementById("countdownPanel");
-    const callPanel = document.getElementById("callPanel");
-    const statusDot = document.getElementById("statusDot");
-    const ring = document.querySelector(".ring-progress");
-    const cdMinutes = document.getElementById("cdMinutes");
-    const cdSeconds = document.getElementById("cdSeconds");
-    const cdSubtitle = document.getElementById("cdSubtitle");
-    const conversation = document.getElementById("conversation");
-    const callNowBtn = document.getElementById("callNowBtn");
-    const listenBtn = document.getElementById("listenBtn");
+    const table = document.createElement("table");
+    table.className = "env-table";
+    const thead = document.createElement("thead");
+    thead.innerHTML = "<tr><th style='width:28%'>Key</th><th>Value</th></tr>";
+    table.appendChild(thead);
+
+    const tbody = document.createElement("tbody");
+    items.forEach((row) => {
+      const tr = document.createElement("tr");
+
+      // Key cell: show the key label (on mobile it appears above the input)
+      const tdKey = document.createElement("td");
+      const keyLabel = document.createElement("div");
+      keyLabel.className = "env-key";
+      keyLabel.textContent = row.key;
+      tdKey.appendChild(keyLabel);
+
+      // Value cell: input/select/textarea
+      const tdVal = document.createElement("td");
+      const valWrapper = document.createElement("div");
+      valWrapper.className = "env-value";
+
+      let input;
+      if (row.key.endsWith("_DAYS")) {
+        input = document.createElement("input");
+        input.type = "text";
+        input.placeholder = "Mon,Tue,Wed,Thu,Fri";
+        input.value = row.value ?? "";
+      } else if (row.key.endsWith("_HOURS_LOCAL")) {
+        input = document.createElement("input");
+        input.type = "text";
+        input.placeholder = "09:00-18:00";
+        input.value = row.value ?? "";
+      } else if (row.key.endsWith("_SECONDS") || row.key.endsWith("_ATTEMPTS") || row.key.endsWith("_PORT")) {
+        input = document.createElement("input");
+        input.type = "number";
+        input.step = "1";
+        input.min = "0";
+        input.value = String(row.value ?? "");
+      } else if (["ROTATE_PROMPTS", "USE_NGROK", "NONINTERACTIVE", "LOG_COLOR", "ENABLE_MEDIA_STREAMS"].includes(row.key)) {
+        input = document.createElement("select");
+        ["true", "false"].forEach((v) => {
+          const opt = document.createElement("option");
+          opt.value = v;
+          opt.textContent = v;
+          if ((row.value ?? "").toString().toLowerCase() === v) opt.selected = true;
+          input.appendChild(opt);
+        });
+      } else {
+        input = document.createElement("input");
+        input.type = "text";
+        input.value = row.value ?? "";
+      }
+      input.dataset.key = row.key;
+      input.autocomplete = "off";
+      input.className = "env-input";
+
+      // For small screens, preserve visible label near input as well (aria)
+      input.setAttribute("aria-label", row.key);
 
     if (callNowBtn) {
       callNowBtn.addEventListener("click", async () => {
@@ -201,301 +317,688 @@
           } else {
             alert("Failed to request a call. Please try again.");
           }
-        }
+
+      valWrapper.appendChild(input);
+      tdVal.appendChild(valWrapper);
+
+      // Attach both cells to the row
+      tr.appendChild(tdKey);
+      tr.appendChild(tdVal);
+      tbody.appendChild(tr);
+    });
+
+    table.appendChild(tbody);
+    container.appendChild(table);
+
+    const saveBtn = qs("#btnSaveEnv");
+    if (saveBtn) saveBtn.disabled = false;
+  }
+
+  async function saveEnvEditor() {
+    const container = qs("#envEditor");
+    if (!container) return;
+    const endpoint = container.getAttribute("data-endpoint-post") || "/api/admin/env";
+
+    const inputs = qsa("input.env-input, select.env-input, textarea.env-input", container);
+    const updates = {};
+    inputs.forEach((el) => {
+      const key = el.dataset.key;
+      if (!key) return;
+      updates[key] = el.value;
+    });
+
+    try {
+      const res = await fetch(endpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ updates }),
+
       });
+      if (!res.ok) throw new Error((await res.text()) || "Failed to save settings.");
+      showToast("Settings saved.");
+    } catch (err) {
+      showToast((err && err.message) || "Failed to save settings.");
+    }
+  }
+
+  function initAdminPanel() {
+    const isAdmin = document.body.getAttribute("data-is-admin") === "1";
+    if (!isAdmin) return;
+    loadEnvEditor();
+    qs("#btnSaveEnv")?.addEventListener("click", saveEnvEditor);
+  }
+
+  // -----------------------
+  // Status poller and UI (countdown + labels)
+  // -----------------------
+  let statusTimer = null;
+  let metricsTimer = null;
+  let callActive = false; // Tracks in-progress state when provided by backend
+
+  function renderNumbersLine(data) {
+    const to = data.to_number || "";
+    const fromSingle = data.from_number || "";
+    const fromPool = Array.isArray(data.from_numbers) ? data.from_numbers : [];
+
+    let fromText = "";
+    if (fromPool && fromPool.length > 0) {
+      const example = fromPool[0] || "";
+      const extra = Math.max(0, fromPool.length - 1);
+      fromText = extra > 0 ? `${example} (+${extra} more)` : example;
+    } else if (fromSingle) {
+      fromText = fromSingle;
+    } else {
+      fromText = "Not configured";
     }
 
-    if (listenBtn) {
-      listenBtn.addEventListener("click", async () => {
-        if (!state.player) state.player = new LiveAudioPlayer();
-        if (!state.audioWs || state.audioWs.readyState !== WebSocket.OPEN) {
-          startAudioWs();
-        }
+    const toText = to || "Not configured";
+    return `<div class="muted" style="font-size:.9rem; margin-top:.5rem; color:var(--muted,#aab2bd);">
+      To: <span style="opacity:.8; font-variant-numeric: tabular-nums;">${escapeHtml(toText)}</span>
+      &nbsp;&nbsp; From: <span style="opacity:.8; font-variant-numeric: tabular-nums;">${escapeHtml(fromText)}</span>
+    </div>`;
+  }
+
+  function renderStatus(data) {
+    const area = qs("#statusArea");
+    if (!area) return;
+
+    // Track active call if backend reports it
+    if (typeof data.call_in_progress === "boolean") {
+      callActive = data.call_in_progress;
+    }
+
+    const parts = [];
+
+    // Show last placement error if recent (within 10 minutes)
+    const err = data.last_error;
+    if (err && err.message) {
+      const age = Date.now() / 1000 - (err.ts || 0);
+      if (age < 600) {
+        parts.push(`<div class="alert">Last error: ${escapeHtml(err.message)}</div>`);
+      }
+    }
+
+    // Active window chip
+    if (data.within_active_window) {
+      parts.push(`<div class="chip" style="display:inline-flex;align-items:center;gap:.5rem;padding:.35rem .6rem;border:1px solid var(--border);border-radius:999px;background:rgba(0,0,0,.2);">
+        <span style="width:.55rem;height:.55rem;border-radius:50%;background:var(--accent,#25c2a0);display:inline-block"></span>
+        <span>${data.call_in_progress ? "Active call in progress" : "Active window"}</span>
+      </div>`);
+    } else {
+      parts.push(`<div class="chip" style="display:inline-flex;align-items:center;gap:.5rem;padding:.35rem .6rem;border:1px solid var(--border);border-radius:999px;background:rgba(0,0,0,.2);">
+        <span style="width:.55rem;height:.55rem;border-radius:50%;background:#e55353;display:inline-block"></span>
+        <span>Inactive now (hours ${escapeHtml(data.active_hours_local || "")})</span>
+      </div>`);
+    }
+
+    // Attempts summary
+    parts.push(
+      `<span class="muted" style="margin-left:.6rem">Attempts (1h/day): ${data.attempts_last_hour}/${data.hourly_max_attempts} · ${data.attempts_last_day}/${data.daily_max_attempts}</span>`
+    );
+
+    // Countdown logic
+    let remain = 0;
+    let total = 0;
+    if (!data.can_attempt_now && data.wait_seconds_if_capped > 0) {
+      remain = data.wait_seconds_if_capped;
+      total = data.wait_seconds_if_capped;
+    } else if (typeof data.seconds_until_next === "number" && data.seconds_until_next != null) {
+      remain = data.seconds_until_next;
+      total = (typeof data.interval_total_seconds === "number" && data.interval_total_seconds > 0)
+        ? data.interval_total_seconds
+        : (data.seconds_until_next || 0);
+    }
+
+    const paused = !data.within_active_window || !!callActive;
+    const svg = buildCountdownBadge(remain, total, paused);
+
+    let label = "";
+    if (callActive) {
+      label = "Calling now";
+    } else if (!data.within_active_window) {
+      label = "Waiting for active window";
+    } else if (!data.can_attempt_now && data.wait_seconds_if_capped > 0) {
+      label = "Waiting due to attempt cap";
+    } else if (typeof remain === "number") {
+      label = "Next attempt";
+    }
+
+    const labelBlock =
+      `<div style="display:flex;flex-direction:column;justify-content:center">
+        <div style="font-size:1.05rem; line-height:1; font-weight:600; color:var(--text,#f3f5f7);">${escapeHtml(label)}</div>
+        <div style="font-size:1.6rem; line-height:1.2; font-variant-numeric: tabular-nums; color:var(--muted,#aab2bd);">in ${formatMMSS(remain)}</div>
+        ${renderNumbersLine(data)}
+      </div>`;
+
+    const focal =
+      `<div style="display:flex;align-items:center;gap:1rem;margin-top:.9rem;flex-wrap:wrap">
+        <div style="flex:0 0 auto">${svg}</div>
+        <div style="flex:1 1 auto">${labelBlock}</div>
+      </div>`;
+
+    area.innerHTML = `${parts.join(" ")} ${focal}`;
+  }
+
+  async function pollStatusOnce() {
+    try {
+      const res = await fetch("/api/status", { method: "GET", cache: "no-cache" });
+      if (!res.ok) throw new Error(await safeErrorText(res) || "Failed to load status.");
+      const data = await res.json();
+
+      if (typeof data.call_in_progress === "boolean" && callActive !== true) {
+        callActive = data.call_in_progress;
+      }
+      renderStatus(data);
+    } catch {
+      const area = qs("#statusArea");
+      if (area) {
+        area.innerHTML = `<div class="muted">Status unavailable.</div>`;
+      }
+    }
+  }
+
+  function initStatusPoll() {
+    pollStatusOnce();
+    clearInterval(statusTimer);
+    statusTimer = setInterval(pollStatusOnce, 1000);
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden) pollStatusOnce();
+    });
+  }
+
+  // -----------------------
+  // Metrics (total calls, total call time)
+  // -----------------------
+  async function fetchMetricsOnce() {
+    try {
+      const res = await fetch("/api/metrics", { method: "GET", cache: "no-cache" });
+      if (!res.ok) return;
+      const data = await res.json();
+      renderMetrics(data);
+    } catch {
+      // ignore transient errors
+    }
+  }
+
+  function renderMetrics(data) {
+    const container = qs("#metricsArea");
+    if (!container) return;
+    const totalCalls = Number(data.total_calls || 0);
+    const totalSeconds = Number(data.total_duration_seconds || 0);
+    const avgSeconds = Number(data.average_call_seconds || 0);
+
+    container.innerHTML = `
+      <div style="display:flex;gap:0.75rem;flex-wrap:wrap;align-items:center">
+        <div style="background:rgba(255,255,255,0.03);padding:0.6rem 0.8rem;border-radius:10px;border:1px solid var(--border);min-width:120px;">
+          <div style="font-size:0.9rem;color:var(--muted)">Total calls</div>
+          <div style="font-size:1.2rem;font-weight:700">${escapeHtml(String(totalCalls))}</div>
+        </div>
+        <div style="background:rgba(255,255,255,0.03);padding:0.6rem 0.8rem;border-radius:10px;border:1px solid var(--border);min-width:160px;">
+          <div style="font-size:0.9rem;color:var(--muted)">Total call time</div>
+          <div style="font-size:1.1rem;font-weight:700">${escapeHtml(formatDurationSeconds(totalSeconds))}</div>
+        </div>
+        <div style="background:rgba(255,255,255,0.03);padding:0.6rem 0.8rem;border-radius:10px;border:1px solid var(--border);min-width:160px;">
+          <div style="font-size:0.9rem;color:var(--muted)">Average</div>
+          <div style="font-size:1.1rem;font-weight:700">${escapeHtml(formatDurationSeconds(avgSeconds))}</div>
+        </div>
+      </div>
+    `;
+  }
+
+  function initMetricsPoll() {
+    fetchMetricsOnce();
+    clearInterval(metricsTimer);
+    metricsTimer = setInterval(fetchMetricsOnce, 5000);
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden) fetchMetricsOnce();
+    });
+  }
+
+  // -----------------------
+  // Live conversation UI (transcript + optional audio listen)
+  // -----------------------
+  (function ensureLivePanelStyle() {
+    const id = "live-convo-style";
+    if (qs(`#${id}`)) return;
+    const style = document.createElement("style");
+    style.id = id;
+    style.textContent = `
+      #livePanel .conversation {
+        transition: background-color .25s ease, box-shadow .25s ease, border-color .25s ease;
+      }
+      #livePanel.active .conversation {
+        background-color: rgba(0,0,0,0.78);
+        border: 1px solid rgba(255,255,255,0.08);
+        border-radius: 12px;
+        padding: 12px 14px;
+        box-shadow: inset 0 0 0 1px rgba(255,255,255,0.02), 0 10px 30px rgba(0,0,0,0.35);
+      }
+      #livePanel .conv-line {
+        margin: .25rem 0;
+        line-height: 1.35;
+      }
+      #livePanel .conv-role {
+        font-weight: 600;
+        margin-right: .4rem;
+      }
+      #livePanel .conv-role.assistant { color: #7ec8ff; }
+      #livePanel .conv-role.callee { color: #ffd27e; }
+      #listenStatus { min-width: 9ch; text-align: right; }
+    `;
+    document.head.appendChild(style);
+  })();
+
+  let liveTimer = null;
+
+  // Audio state
+  let ws = null;
+  let audioCtx = null;
+  let workletLoaded = false;
+
+  // Chain nodes (created on demand)
+  let playerNode = null;    // AudioWorkletNode (preferred)
+  let scriptNode = null;    // ScriptProcessor fallback
+  let chainInput = null;    // Current source node into chain
+  let preGain = null;       // Gain used for prebuffer fade-in
+  let lowpass = null;       // BiquadFilterNode to smooth 8 kHz content
+  let compressor = null;    // DynamicsCompressorNode to even out harshness
+
+  // Buffer control
+  let lastBufferSamples = 0;
+  let targetBufferSeconds = 0.18; // modest jitter buffer for fewer dropouts
+  let targetBufferSamples = 0;
+
+  // Fallback queue
+  let audioQueue = [];
+  let playing = false;
+
+  function ensureLivePanel() {
+    let panel = qs("#livePanel");
+    if (panel) return panel;
+    const main = qs("main") || document.body;
+    panel = document.createElement("section");
+    panel.id = "livePanel";
+    panel.className = "panel";
+    panel.innerHTML = `
+      <div class="panel-header" style="display:flex;justify-content:space-between;align-items:center;gap:1rem">
+        <h2 class="panel-title">Live Conversation</h2>
+        <div style="display:flex;align-items:center;gap:.5rem">
+          <button id="btnListenLive" class="btn" disabled>Listen live</button>
+          <span id="listenStatus" class="muted" aria-live="polite"></span>
+        </div>
+      </div>
+      <div id="liveConversation" class="conversation" style="min-height:140px"></div>
+    `;
+    main.appendChild(panel);
+    return panel;
+  }
+
+  function appendTranscriptEntry(container, entry) {
+    const role = entry.role || "Speaker";
+    const text = entry.text || "";
+    const line = document.createElement("div");
+    line.className = "conv-line";
+    line.setAttribute("data-role", role);
+    line.setAttribute("data-final", entry.final ? "1" : "0");
+    line.innerHTML = `<span class="conv-role ${role === "Assistant" ? "assistant" : "callee"}">${escapeHtml(role)}:</span> <span class="conv-text">${escapeHtml(text)}</span>`;
+    container.appendChild(line);
+    container.scrollTop = container.scrollHeight;
+  }
+
+  // Merge logic: render finals and keep only one updating partial callee line
+  function renderLiveTranscriptList(container, list) {
+    const finals = list.filter((e) => e && e.final);
+    const latestPartial = [...list].reverse().find((e) => e && !e.final);
+
+    const prevFinalCount = Number(container.getAttribute("data-final-count") || "0");
+    if (finals.length !== prevFinalCount) {
+      container.innerHTML = "";
+      finals.forEach((e) => appendTranscriptEntry(container, e));
+      container.setAttribute("data-final-count", String(finals.length));
+    }
+    let partialEl = qs(".conv-line[data-final='0']", container);
+    if (latestPartial && latestPartial.text) {
+      if (!partialEl) {
+        partialEl = document.createElement("div");
+        partialEl.className = "conv-line";
+        partialEl.setAttribute("data-final", "0");
+        partialEl.innerHTML = `<span class="conv-role callee">Callee:</span> <span class="conv-text"></span>`;
+        container.appendChild(partialEl);
+      }
+      qs(".conv-text", partialEl).textContent = latestPartial.text;
+      container.scrollTop = container.scrollHeight;
+    } else {
+      if (partialEl) partialEl.remove();
+    }
+  }
+
+  async function pollLiveTranscript() {
+    try {
+      const res = await fetch("/api/live", { method: "GET", cache: "no-cache" });
+      if (!res.ok) return;
+      const data = await res.json();
+      const container = qs("#liveConversation");
+      const btn = qs("#btnListenLive");
+      const status = qs("#listenStatus");
+      const panel = qs("#livePanel");
+      if (!container || !btn || !status || !panel) return;
+
+      const inProgress = !!data.in_progress;
+      callActive = inProgress;
+      panel.classList.toggle("active", inProgress);
+
+      // Enable/disable Listen button based on feature flag and call state
+      btn.disabled = !inProgress || !data.media_streams_enabled;
+
+      // Render merged transcript
+      const list = Array.isArray(data.transcript) ? data.transcript : [];
+      renderLiveTranscriptList(container, list);
+
+      // Stop listening automatically when call ends
+      if (!inProgress && ws) {
+        stopListening();
+      }
+    } catch {
+      // ignore transient errors
+    }
+  }
+
+  function initLivePanel() {
+    const panel = ensureLivePanel();
+    const btn = qs("#btnListenLive", panel);
+    btn?.addEventListener("click", () => {
+      if (ws) stopListening();
+      else startListening();
+    });
+    clearInterval(liveTimer);
+    liveTimer = setInterval(pollLiveTranscript, 1000);
+    pollLiveTranscript();
+  }
+
+  // μ-law decoding and simple resample
+  function mulawDecodeSample(mu) {
+    mu = ~mu & 0xff;
+    const sign = (mu & 0x80) ? -1 : 1;
+    const exponent = (mu >> 4) & 0x07;
+    const mantissa = mu & 0x0f;
+    let sample = ((mantissa << 4) + 8) << (exponent + 3);
+    sample = sign * (sample - 33);
+    return Math.max(-1, Math.min(1, sample / 32768));
+  }
+
+  function decodeMuLawToFloat32(payloadB64) {
+    const bin = atob(payloadB64);
+    const out = new Float32Array(bin.length);
+    for (let i = 0; i < bin.length; i++) {
+      out[i] = mulawDecodeSample(bin.charCodeAt(i));
+    }
+    return out; // 8 kHz mono
+  }
+
+  function decodeMuLawBytesToFloat32(u8) {
+    const n = u8.length | 0;
+    const out = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      out[i] = mulawDecodeSample(u8[i]);
+    }
+    return out;
+  }
+
+  function resampleToContextRate(src8k, contextRate, ratioAdjust = 1.0) {
+    if (!src8k || src8k.length === 0) return src8k;
+    const srcRate = 8000;
+    const ratio = (contextRate / srcRate) * (ratioAdjust || 1.0);
+    const outLen = Math.max(1, Math.floor(src8k.length * ratio));
+    const out = new Float32Array(outLen);
+    for (let i = 0; i < outLen; i++) {
+      const srcPos = i / ratio;
+      const i0 = Math.floor(srcPos);
+      const i1 = Math.min(src8k.length - 1, i0 + 1);
+      const frac = srcPos - i0;
+      out[i] = src8k[i0] * (1 - frac) + src8k[i1] * frac;
+    }
+    return out;
+  }
+
+  function audioProcess(ev) {
+    const out = ev.outputBuffer.getChannelData(0);
+    out.fill(0);
+    if (!playing || audioQueue.length === 0) return;
+    const chunk = audioQueue.shift();
+    if (!chunk) return;
+    const n = Math.min(out.length, chunk.length);
+    out.set(chunk.subarray(0, n), 0);
+    if (chunk.length > n) {
+      audioQueue.unshift(chunk.subarray(n));
+    }
+  }
+
+  function computeRatioAdjust() {
+    if (!audioCtx) return 1.0;
+    const margin = audioCtx.sampleRate * 0.04; // 40 ms
+    const diff = (lastBufferSamples || 0) - (targetBufferSamples || 0);
+    if (diff > margin * 2) return 0.98;
+    if (diff > margin) return 0.995;
+    if (diff < -margin * 2) return 1.02;
+    if (diff < -margin) return 1.005;
+    return 1.0;
+  }
+
+  function ensureAudioChain() {
+    if (!audioCtx) return;
+
+    // Create shared processing nodes
+    if (!preGain) {
+      preGain = audioCtx.createGain();
+      preGain.gain.value = 0.0; // start muted; ramp in after prebuffer fills
+    }
+    if (!lowpass) {
+      lowpass = audioCtx.createBiquadFilter();
+      lowpass.type = "lowpass";
+      lowpass.frequency.value = 3600; // μ-law 8 kHz typical passband
+      lowpass.Q.value = 0.707;
+    }
+    if (!compressor) {
+      compressor = audioCtx.createDynamicsCompressor();
+      compressor.threshold.value = -18;
+      compressor.knee.value = 24;
+      compressor.ratio.value = 2.5;
+      compressor.attack.value = 0.003;
+      compressor.release.value = 0.25;
+    }
+
+    // Rebuild chain for current source
+    try { preGain.disconnect(); } catch {}
+    try { lowpass.disconnect(); } catch {}
+    try { compressor.disconnect(); } catch {}
+
+    if (chainInput) {
+      try { chainInput.disconnect(); } catch {}
+      chainInput.connect(preGain);
+      preGain.connect(lowpass);
+      lowpass.connect(compressor);
+      compressor.connect(audioCtx.destination);
+    }
+  }
+
+  async function startListening() {
+    const status = qs("#listenStatus");
+    const btn = qs("#btnListenLive");
+
+    if (btn && btn.disabled) return;
+
+    try {
+      if (!audioCtx) {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        try { await audioCtx.resume(); } catch {}
+        targetBufferSamples = Math.max(1, Math.floor(audioCtx.sampleRate * targetBufferSeconds));
+      }
+
+      // Try to initialize AudioWorklet-based player
+      if (audioCtx.audioWorklet && !workletLoaded) {
         try {
-          await state.player.ensureContext();
-          listenBtn.textContent = "Listening…";
-          listenBtn.disabled = true;
+          await audioCtx.audioWorklet.addModule("/static/live-audio-worklet.js");
+          workletLoaded = true;
         } catch {
-          alert("Unable to start audio context. Please try again.");
+          workletLoaded = false;
         }
-      });
-    }
-
-    function renderCountdown() {
-      const end = state.nextCallEpochSec;
-      const start = state.nextCallStartEpochSec;
-      if (!end || !start || end <= start) {
-        cdMinutes.textContent = "--";
-        cdSeconds.textContent = "--";
-        cdSubtitle.textContent = "Waiting for schedule...";
-        updateRingProgress(ring, 0);
-        return;
       }
-      const now = Date.now() / 1000;
-      const total = Math.max(1, end - start);
-      const remaining = Math.max(0, end - now);
 
-      const { mStr, sStr } = formatMMSS(remaining);
-      cdMinutes.textContent = mStr;
-      cdSeconds.textContent = sStr;
-
-      const fraction = Math.max(0, Math.min(1, remaining / total));
-      updateRingProgress(ring, fraction);
-
-      cdSubtitle.textContent = remaining > 0 ? "Until next call attempt" : "Placing call…";
-    }
-
-    function startCountdown() {
-      if (state.countdownTimer) return;
-      renderCountdown();
-      state.countdownTimer = setInterval(renderCountdown, 500);
-    }
-    function stopCountdown() {
-      if (state.countdownTimer) {
-        clearInterval(state.countdownTimer);
-        state.countdownTimer = null;
-      }
-    }
-
-    function renderTranscript(lines) {
-      conversation.innerHTML = "";
-      if (!lines || !lines.length) {
-        const empty = document.createElement("div");
-        empty.className = "empty";
-        empty.textContent = "No transcript yet…";
-        conversation.appendChild(empty);
-        return;
-      }
-      for (const msg of lines) {
-        const row = document.createElement("div");
-        row.className = "message" + (msg.partial ? " partial" : "");
-        const role = document.createElement("div");
-        role.className = "role " + (msg.role === "Assistant" ? "assistant" : "callee");
-        role.textContent = msg.role;
-        const text = document.createElement("div");
-        text.className = "text";
-        text.textContent = msg.text;
-        row.appendChild(role);
-        row.appendChild(text);
-        conversation.appendChild(row);
-      }
-      conversation.scrollTop = conversation.scrollHeight;
-    }
-
-    async function refreshStatus() {
-      try {
-        const data = await apiGet("/api/scamcalls/status");
-
-        state.active = !!data.active;
-        state.callSid = data.callSid || null;
-
-        state.nextCallEpochSec = data.nextCallEpochSec || null;
-        state.nextCallStartEpochSec = data.nextCallStartEpochSec || null;
-
-        setText("destNumber", data.destNumber || "—");
-        setText("fromNumber", data.fromNumber || "—");
-        setText("activeWindow", data.activeWindow || "—");
-        if (data.caps && typeof data.caps.hourly === "number" && typeof data.caps.daily === "number") {
-          setText("caps", `${data.caps.hourly}/hour, ${data.caps.daily}/day`);
-        }
-        setText("publicUrl", data.publicUrl || "auto");
-
-        if (state.active) {
-          statusDot.classList.remove("idle"); statusDot.classList.add("active");
-          hide(cdPanel); show(callPanel);
-          setText("callSid", state.callSid || "—");
-          setText("callStatusBadge", "Connected");
-          if (listenBtn) {
-            listenBtn.textContent = "Listen Live";
-            listenBtn.disabled = false;
+      if (workletLoaded && !playerNode) {
+        playerNode = new AudioWorkletNode(audioCtx, "live-player-processor");
+        playerNode.port.onmessage = (ev) => {
+          const d = ev.data || {};
+          if (d.type === "buffer") {
+            lastBufferSamples = d.samples | 0;
+            // Auto-unmute when prebuffer is ready
+            if (preGain && preGain.gain.value === 0 && lastBufferSamples >= Math.floor(targetBufferSamples * 0.6)) {
+              const t = audioCtx.currentTime;
+              preGain.gain.cancelScheduledValues(t);
+              preGain.gain.setValueAtTime(preGain.gain.value, t);
+              preGain.gain.linearRampToValueAtTime(1.0, t + 0.06);
+            }
           }
-          stopCountdown();
-          startActivePolling();
+        };
+      }
+
+      const scheme = location.protocol === "https:" ? "wss" : "ws";
+      ws = new WebSocket(`${scheme}://${location.host}/client-audio`);
+      try { ws.binaryType = "arraybuffer"; } catch {}
+
+      ws.onopen = async () => {
+        lastBufferSamples = 0;
+
+        // Choose chain input based on available nodes
+        if (workletLoaded) {
+          chainInput = playerNode;
         } else {
-          statusDot.classList.remove("active"); statusDot.classList.add("idle");
-          show(cdPanel); hide(callPanel);
-          stopActivePolling();
-          stopAudioWs();
-          if (listenBtn) {
-            listenBtn.textContent = "Listen Live";
-            listenBtn.disabled = false;
+          // Fallback to ScriptProcessor with smaller buffer to reduce latency
+          if (!scriptNode) {
+            const bufSize = 1024;
+            scriptNode = audioCtx.createScriptProcessor(bufSize, 0, 1);
+            scriptNode.onaudioprocess = audioProcess;
           }
-          startCountdown();
+          chainInput = scriptNode;
+          playing = true;
         }
-      } catch (err) {
-        setText("appStatus", `Error: ${(err && err.message) || err}`);
-      }
-    }
 
-    async function pollActiveCall() {
-      if (!state.active) return;
-      try {
-        const data = await apiGet("/api/scamcalls/active");
-        if (data && data.callSid) {
-          setText("callSid", data.callSid);
+        ensureAudioChain(); // (re)wire processing chain
+        // Connect chain to destination if not already
+        if (workletLoaded && playerNode && playerNode.numberOfOutputs > 0) {
+          // No additional connect needed here; ensureAudioChain wires it
+        } else if (scriptNode) {
+          // ensureAudioChain already attached scriptNode path
         }
-        if (data && Array.isArray(data.transcript)) {
-          renderTranscript(data.transcript);
-        }
-        if (data && (data.status === "ending" || data.status === "completed" || data.status === "idle")) {
-          state.active = false;
-          stopActivePolling();
-          stopAudioWs();
-          await refreshStatus();
-        }
-      } catch {
-        // Non-fatal
-      }
-    }
 
-    function startActivePolling() {
-      stopCountdown();
-      stopActivePolling();
-      pollActiveCall();
-      state.activePollTimer = setInterval(pollActiveCall, 1000);
-    }
-    function stopActivePolling() {
-      if (state.activePollTimer) {
-        clearInterval(state.activePollTimer);
-        state.activePollTimer = null;
-      }
-    }
+        if (status) status.textContent = "Connected";
+        if (btn) btn.textContent = "Stop listening";
+      };
 
-    function startAudioWs() {
-      if (state.audioWs && state.audioWs.readyState === WebSocket.OPEN) return;
-      state.audioWs = new WebSocket(wsUrl("/ws/live-audio"));
-      if (!state.player) state.player = new LiveAudioPlayer();
-
-      state.audioWs.onmessage = async (ev) => {
+      ws.onmessage = (ev) => {
         try {
-          const msg = JSON.parse(ev.data);
-          if (msg && msg.type === "media" && typeof msg.payload === "string") {
-            await state.player.pushMuLawFrame(msg.payload);
+          let pcm8k = null;
+
+          if (ev.data instanceof ArrayBuffer) {
+            // Binary μ-law payload (optional server optimization)
+            pcm8k = decodeMuLawBytesToFloat32(new Uint8Array(ev.data));
+          } else if (typeof ev.data === "string") {
+            // Accept both raw base64 μ-law and JSON envelopes
+            if (ev.data.length > 0 && ev.data[0] === "{") {
+              try {
+                const obj = JSON.parse(ev.data);
+
+                // Prefer the caller (inbound) track if provided
+                const track = obj && obj.media && (obj.media.track || obj.media.direction);
+                const payloadB64 = obj && obj.media && obj.media.payload ? obj.media.payload : obj.payload;
+
+                if (payloadB64) {
+                  // If server labels tracks, ignore outbound to avoid hearing the callee/bot
+                  if (track && typeof track === "string") {
+                    const t = track.toLowerCase();
+                    if (t.includes("outbound") || t.includes("callee")) {
+                      // Ignore outbound frames so we only play caller audio
+                      return;
+                    }
+                  }
+                  pcm8k = decodeMuLawToFloat32(payloadB64);
+                } else {
+                  return;
+                }
+              } catch {
+                // Fallback assume raw base64 string
+                pcm8k = decodeMuLawToFloat32(ev.data);
+              }
+            } else {
+              pcm8k = decodeMuLawToFloat32(ev.data);
+            }
+          } else {
+            return;
+          }
+
+          if (!pcm8k || !audioCtx) return;
+
+          const ratioAdjust = computeRatioAdjust();
+          const pcm = resampleToContextRate(pcm8k, audioCtx.sampleRate, ratioAdjust);
+
+          if (workletLoaded && playerNode) {
+            if (pcm && pcm.buffer) {
+              playerNode.port.postMessage({ type: "push", pcm: pcm.buffer }, [pcm.buffer]);
+            }
+          } else {
+            audioQueue.push(pcm);
           }
         } catch {
           // ignore malformed frames
         }
       };
-      state.audioWs.onclose = () => {};
-      state.audioWs.onerror = () => {};
-    }
 
-    async function stopAudioWs() {
-      if (state.audioWs) {
-        try { state.audioWs.close(); } catch {}
-      }
-      state.audioWs = null;
-      if (state.player) {
-        try { await state.player.stop(); } catch {}
-        state.player = null;
-      }
-    }
+      ws.onclose = () => {
+        if (status) status.textContent = "Disconnected";
+        if (btn) btn.textContent = "Listen live";
+        if (!workletLoaded) {
+          playing = false;
+        } else if (preGain && audioCtx) {
+          const t = audioCtx.currentTime;
+          preGain.gain.cancelScheduledValues(t);
+          preGain.gain.setValueAtTime(preGain.gain.value, t);
+          preGain.gain.linearRampToValueAtTime(0.0, t + 0.05);
+        }
+        ws = null;
+      };
 
-    // Initial kick-off and periodic refresh
-    refreshStatus();
-    state.pollTimer = setInterval(refreshStatus, 5000);
+      ws.onerror = () => {
+        if (status) status.textContent = "Audio error";
+        if (btn) btn.textContent = "Listen live";
+        try { ws && ws.close(); } catch {}
+        ws = null;
+        if (!workletLoaded) playing = false;
+      };
+    } catch {
+      const status = qs("#listenStatus");
+      const btn = qs("#btnListenLive");
+      if (status) status.textContent = "Audio not available";
+      if (btn) btn.textContent = "Listen live";
+      ws = null;
+    }
   }
 
-  function initHistoryPage() {
-    const list = document.getElementById("historyList");
-    const panel = document.getElementById("transcriptPanel");
-    const conv = document.getElementById("historyConversation");
-    const outcome = document.getElementById("historyOutcome");
-    const callSidEl = document.getElementById("historyCallSid");
-
-    function renderHistory(calls) {
-      list.innerHTML = "";
-      if (!calls || !calls.length) {
-        const empty = document.createElement("div");
-        empty.className = "empty";
-        empty.textContent = "No calls yet.";
-        list.appendChild(empty);
-        return;
-      }
-      for (const c of calls) {
-        const item = document.createElement("div");
-        item.className = "history-item";
-
-        const title = document.createElement("div");
-        title.className = "title";
-        const started = new Date((c.startedAt || 0) * 1000);
-        title.textContent = started.toLocaleString();
-        const meta = document.createElement("div");
-        meta.className = "meta";
-        meta.textContent = `SID ${c.callSid} · ${Math.round(c.durationSec || 0)}s`;
-        const outcomeEl = document.createElement("div");
-        outcomeEl.className = "outcome";
-        outcomeEl.textContent = c.outcome || "—";
-        const act = document.createElement("div");
-        act.className = "action";
-        const btn = document.createElement("a");
-        btn.href = "javascript:void(0)";
-        btn.className = "button secondary";
-        btn.textContent = "View Transcript";
-        btn.addEventListener("click", () => loadTranscript(c.callSid));
-
-        item.appendChild(title);
-        item.appendChild(meta);
-        item.appendChild(outcomeEl);
-        item.appendChild(act);
-        act.appendChild(btn);
-        list.appendChild(item);
-      }
+  function stopListening() {
+    const btn = qs("#btnListenLive");
+    const status = qs("#listenStatus");
+    try { ws && ws.close(); } catch {}
+    ws = null;
+    if (!workletLoaded) {
+      playing = false;
+    } else if (preGain && audioCtx) {
+      const t = audioCtx.currentTime;
+      preGain.gain.cancelScheduledValues(t);
+      preGain.gain.setValueAtTime(preGain.gain.value, t);
+      preGain.gain.linearRampToValueAtTime(0.0, t + 0.05);
     }
-
-    function renderTranscript(lines) {
-      conv.innerHTML = "";
-      if (!lines || !lines.length) {
-        const empty = document.createElement("div");
-        empty.className = "empty";
-        empty.textContent = "No transcript available.";
-        conv.appendChild(empty);
-        return;
-      }
-      for (const msg of lines) {
-        const row = document.createElement("div");
-        row.className = "message";
-        const role = document.createElement("div");
-        role.className = "role " + (msg.role === "Assistant" ? "assistant" : "callee");
-        role.textContent = msg.role;
-        const text = document.createElement("div");
-        text.className = "text";
-        text.textContent = msg.text;
-        row.appendChild(role);
-        row.appendChild(text);
-        conv.appendChild(row);
-      }
-      conv.scrollTop = conv.scrollHeight;
-    }
-
-    async function loadHistory() {
-      try {
-        const data = await apiGet("/api/scamcalls/history");
-        renderHistory((data && data.calls) || []);
-        document.getElementById("publicUrl").textContent = (data && data.publicUrl) || "auto";
-      } catch (err) {
-        list.innerHTML = `<div class="empty">Error loading history: ${(err && err.message) || err}</div>`;
-      }
-    }
-
-    async function loadTranscript(callSid) {
-      try {
-        const data = await apiGet(`/api/scamcalls/transcript/${encodeURIComponent(callSid)}`);
-        callSidEl.textContent = callSid;
-        outcome.textContent = data.outcome || "—";
-        renderTranscript((data && data.transcript) || []);
-        panel.classList.remove("hidden");
-        panel.scrollIntoView({ behavior: "smooth", block: "start" });
-      } catch (err) {
-        callSidEl.textContent = callSid;
-        outcome.textContent = "Error";
-        conv.innerHTML = `<div class="empty">Error loading transcript: ${(err && err.message) || err}</div>`;
-        panel.classList.remove("hidden");
-      }
-    }
-
-    loadHistory();
+    if (status) status.textContent = "Stopped";
+    if (btn) btn.textContent = "Listen live";
   }
+
 
   const pageLive = isLivePage;
   if (pageLive) initLivePage();
@@ -757,4 +1260,21 @@
     // Initialize admin button state
     updateAdminButton();
   }
+=======
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden && ws) stopListening();
+  });
+
+  // -----------------------
+  // Init
+  // -----------------------
+  document.addEventListener("DOMContentLoaded", () => {
+    initGreetingModal();
+    initCallNow();
+    initAdminPanel();
+    initStatusPoll();
+    initMetricsPoll();
+    initLivePanel();
+  });
+
 })();
