@@ -538,6 +538,10 @@ _next_call_epoch_s: Optional[int] = None
 _interval_start_epoch_s: Optional[int] = None
 _interval_total_seconds: Optional[int] = None
 
+# One-time greeting phrase storage (thread-safe)
+_one_shot_greeting_lock = threading.Lock()
+_one_shot_greeting: Optional[str] = None
+
 
 def _prune_attempts(now_ts: int, to_number: str) -> None:
     with _attempts_lock:
@@ -1513,6 +1517,21 @@ def _say_with_prosody(vr: VoiceResponse, text: str, voice: str, language: str) -
         vr.say(text, voice=voice, language=language)
 
 
+def _pop_one_shot_opening() -> Optional[str]:
+    """
+    Atomically return and clear the queued one-time greeting phrase.
+    Used to consume exactly once for the first outbound call after submission.
+    
+    This implements the consume-once semantics for custom greeting phrases,
+    ensuring they're only used for a single call attempt.
+    """
+    global _one_shot_greeting
+    with _one_shot_greeting_lock:
+        phrase = _one_shot_greeting
+        _one_shot_greeting = None
+        return phrase
+
+
 def _build_opening_lines_for_sid(call_sid: str) -> List[str]:
     one = _pop_one_shot_opening()
     if one:
@@ -2114,6 +2133,51 @@ def api_metrics():
     except Exception as e:
         log.exception("Failed computing metrics: %s", e)
         return jsonify({"total_calls": 0, "total_duration_seconds": 0, "average_call_seconds": 0})
+
+
+# One-time greeting phrase endpoint (for frontend to set custom greeting)
+@app.route("/api/next-greeting", methods=["POST", "GET"])
+def api_next_greeting():
+    """
+    POST: Set a greeting phrase for the next call (5-15 words enforced)
+    GET: Check if a greeting is queued and word count
+    
+    The frontend calls this when users submit custom greeting phrases.
+    Thread-safe storage ensures exactly-once consumption per call.
+    """
+    global _one_shot_greeting
+    
+    if request.method == "POST":
+        try:
+            data = request.get_json() or {}
+            phrase = (data.get("phrase") or "").strip()
+            
+            if not phrase:
+                return jsonify({"ok": False, "message": "Empty phrase"}), 400
+            
+            # Validate 5-15 words
+            words = phrase.split()
+            if len(words) < 5:
+                return jsonify({"ok": False, "message": "Phrase must be at least 5 words"}), 400
+            if len(words) > 15:
+                return jsonify({"ok": False, "message": "Phrase must be at most 15 words"}), 400
+            
+            # Store for one-time use
+            with _one_shot_greeting_lock:
+                _one_shot_greeting = phrase
+            
+            log.info("One-time greeting phrase set: %d words", len(words))
+            return jsonify({"ok": True})
+            
+        except Exception as e:
+            log.exception("Failed to set greeting phrase: %s", e)
+            return jsonify({"ok": False, "message": str(e)}), 400
+    
+    else:  # GET
+        with _one_shot_greeting_lock:
+            queued = _one_shot_greeting is not None
+            words = len(_one_shot_greeting.split()) if _one_shot_greeting else 0
+        return jsonify({"queued": queued, "words": words})
 
 
 @app.route("/health", methods=["GET"])

@@ -1,3 +1,21 @@
+/**
+ * Scam Call Console Frontend
+ * 
+ * Main functionality:
+ * - Greeting modal for one-time custom phrases (5-15 words)
+ * - Call-now button with rate limiting feedback
+ * - Admin environment editor for configuration
+ * - Real-time status polling with countdown display
+ * - Live transcript with optional audio streaming
+ * - Metrics display (total calls, time, averages)
+ * 
+ * Key endpoints:
+ * - /api/next-greeting (POST/GET) - Custom greeting phrases
+ * - /api/call-now (POST) - Manual call triggering
+ * - /api/status (GET) - Current state and countdown
+ * - /api/live (GET) - Live transcript and call status
+ * - /api/metrics (GET) - Call statistics
+ */
 (function () {
   "use strict";
 
@@ -5,15 +23,20 @@
   const qs = (sel, ctx = document) => ctx.querySelector(sel);
   const qsa = (sel, ctx = document) => Array.from(ctx.querySelectorAll(sel));
 
-  // Toast helper
-  function showToast(message, durationMs = 3200) {
+  // Toast helper - supports different message types for styling
+  function showToast(message, type = "info", durationMs = 3200) {
     const el = qs("#toast");
     if (!el) return;
     el.textContent = message;
-    el.classList.add("toast--show");
+    
+    // Apply type-specific styling
+    el.className = "toast toast--show";
+    if (type === "error") el.classList.add("toast--error");
+    else if (type === "success") el.classList.add("toast--success");
+    
     clearTimeout(showToast._t);
     showToast._t = setTimeout(() => {
-      el.classList.remove("toast--show");
+      el.classList.remove("toast--show", "toast--error", "toast--success");
     }, durationMs);
   }
 
@@ -186,7 +209,8 @@
       throw new Error(`HTTP ${resp.status} posting ${path}`);
     }
     return resp.json();
-=======
+  }
+
   // -----------------------
   // Call-now button wiring
   // -----------------------
@@ -302,21 +326,6 @@
 
       // For small screens, preserve visible label near input as well (aria)
       input.setAttribute("aria-label", row.key);
-
-    if (callNowBtn) {
-      callNowBtn.addEventListener("click", async () => {
-        try {
-          callNowBtn.disabled = true;
-          await apiPost("/api/scamcalls/call-now");
-          setTimeout(() => { callNowBtn.disabled = false; }, 3000);
-        } catch (err) {
-          callNowBtn.disabled = false;
-          // Check if it's a rate limit error
-          if (err.rateLimit) {
-            showToast("Max calls reached in alloted time. Dont over scam the scammer!", "error");
-          } else {
-            alert("Failed to request a call. Please try again.");
-          }
 
       valWrapper.appendChild(input);
       tdVal.appendChild(valWrapper);
@@ -999,275 +1008,13 @@
     if (btn) btn.textContent = "Listen live";
   }
 
-
-  const pageLive = isLivePage;
-  if (pageLive) initLivePage();
-  if (isHistoryPage) initHistoryPage();
-
-  // ===============================
-  // Admin and Modal Functionality
-  // ===============================
-  
-  let isAdminLoggedIn = false;
-
-  // Toast notifications
-  function showToast(message, type = "info") {
-    const container = document.getElementById("toastContainer");
-    if (!container) return;
-
-    const toast = document.createElement("div");
-    toast.className = `toast ${type}`;
-    toast.innerHTML = `<div class="toast-message">${message}</div>`;
-    
-    container.appendChild(toast);
-    
-    // Auto-remove after 5 seconds
-    setTimeout(() => {
-      if (toast.parentNode) {
-        toast.parentNode.removeChild(toast);
-      }
-    }, 5000);
-  }
-
-  // Modal utilities
-  function showModal(id) {
-    const modal = document.getElementById(id);
-    if (modal) modal.classList.remove("hidden");
-  }
-
-  function hideModal(id) {
-    const modal = document.getElementById(id);
-    if (modal) modal.classList.add("hidden");
-  }
-
-  // Admin functionality
-  function updateAdminButton() {
-    const adminBtn = document.getElementById("adminBtn");
-    if (!adminBtn) return;
-    
-    if (isAdminLoggedIn) {
-      adminBtn.textContent = "Admin ✓";
-      adminBtn.classList.add("logged-in");
-    } else {
-      adminBtn.textContent = "Admin";
-      adminBtn.classList.remove("logged-in");
-    }
-  }
-
-  async function adminLogin(username, password) {
-    try {
-      await apiPost("/api/admin/login", { username, password });
-      isAdminLoggedIn = true;
-      updateAdminButton();
-      hideModal("adminLoginModal");
-      showToast("Admin login successful", "success");
-      return true;
-    } catch (err) {
-      return false;
-    }
-  }
-
-  async function adminLogout() {
-    try {
-      await apiPost("/api/admin/logout");
-      isAdminLoggedIn = false;
-      updateAdminButton();
-      hideModal("adminSettingsModal");
-      showToast("Admin logout successful", "success");
-    } catch (err) {
-      showToast("Logout failed", "error");
-    }
-  }
-
-  async function loadAdminConfig() {
-    try {
-      const data = await apiGet("/api/admin/config");
-      const configForm = document.getElementById("configForm");
-      if (!configForm) return;
-
-      configForm.innerHTML = "";
-      
-      for (const [key, value] of Object.entries(data.config || {})) {
-        const group = document.createElement("div");
-        group.className = "form-group";
-        group.innerHTML = `
-          <label for="config_${key}">${key}:</label>
-          <input type="text" id="config_${key}" class="form-input" value="${value}" data-key="${key}" />
-        `;
-        configForm.appendChild(group);
-      }
-    } catch (err) {
-      showToast("Failed to load config", "error");
-    }
-  }
-
-  async function saveAdminConfig() {
-    try {
-      const configForm = document.getElementById("configForm");
-      if (!configForm) return;
-
-      const updates = {};
-      const inputs = configForm.querySelectorAll("input[data-key]");
-      
-      inputs.forEach(input => {
-        updates[input.dataset.key] = input.value;
-      });
-
-      await fetch("/api/admin/config", {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ updates })
-      });
-
-      showToast("Configuration saved successfully", "success");
-    } catch (err) {
-      showToast("Failed to save configuration", "error");
-    }
-  }
-
-  // Greeting phrase functionality
-  function updateWordCount() {
-    const input = document.getElementById("greetingInput");
-    const counter = document.getElementById("wordCount");
-    if (!input || !counter) return;
-
-    const words = input.value.trim().split(/\s+/).filter(w => w.length > 0);
-    counter.textContent = words.length;
-    
-    const saveBtn = document.getElementById("greetingSaveBtn");
-    if (saveBtn) {
-      saveBtn.disabled = words.length < 5 || words.length > 15;
-    }
-  }
-
-  async function saveGreeting() {
-    const input = document.getElementById("greetingInput");
-    if (!input) return;
-
-    try {
-      await apiPost("/api/scamcalls/next-greeting", { phrase: input.value.trim() });
-      hideModal("greetingModal");
-      input.value = "";
-      updateWordCount();
-      showToast("Greeting phrase saved for next call", "success");
-    } catch (err) {
-      showToast("Failed to save greeting phrase", "error");
-    }
-  }
-
-  // Event listeners for admin functionality
-  if (pageLive) {
-    // Admin button
-    const adminBtn = document.getElementById("adminBtn");
-    if (adminBtn) {
-      adminBtn.addEventListener("click", () => {
-        if (isAdminLoggedIn) {
-          loadAdminConfig();
-          showModal("adminSettingsModal");
-        } else {
-          showModal("adminLoginModal");
-        }
-      });
-    }
-
-    // Admin login modal
-    const adminLoginBtn = document.getElementById("adminLoginBtn");
-    const adminUsername = document.getElementById("adminUsername");
-    const adminPassword = document.getElementById("adminPassword");
-    const adminLoginError = document.getElementById("adminLoginError");
-    
-    if (adminLoginBtn && adminUsername && adminPassword) {
-      adminLoginBtn.addEventListener("click", async () => {
-        adminLoginError.classList.add("hidden");
-        const success = await adminLogin(adminUsername.value, adminPassword.value);
-        if (!success) {
-          adminLoginError.textContent = "Invalid credentials";
-          adminLoginError.classList.remove("hidden");
-        }
-        adminUsername.value = "";
-        adminPassword.value = "";
-      });
-
-      // Enter key support
-      adminPassword.addEventListener("keypress", (e) => {
-        if (e.key === "Enter") {
-          adminLoginBtn.click();
-        }
-      });
-    }
-
-    // Admin login cancel
-    const adminLoginCancel = document.getElementById("adminLoginCancel");
-    if (adminLoginCancel) {
-      adminLoginCancel.addEventListener("click", () => {
-        hideModal("adminLoginModal");
-      });
-    }
-
-    // Admin settings modal
-    const adminSaveBtn = document.getElementById("adminSaveBtn");
-    if (adminSaveBtn) {
-      adminSaveBtn.addEventListener("click", saveAdminConfig);
-    }
-
-    const adminLogoutBtn = document.getElementById("adminLogoutBtn");
-    if (adminLogoutBtn) {
-      adminLogoutBtn.addEventListener("click", adminLogout);
-    }
-
-    const adminSettingsCancel = document.getElementById("adminSettingsCancel");
-    if (adminSettingsCancel) {
-      adminSettingsCancel.addEventListener("click", () => {
-        hideModal("adminSettingsModal");
-      });
-    }
-
-    // Greeting modal
-    const addGreetingBtn = document.getElementById("addGreetingBtn");
-    if (addGreetingBtn) {
-      addGreetingBtn.addEventListener("click", () => {
-        showModal("greetingModal");
-        updateWordCount();
-      });
-    }
-
-    const greetingInput = document.getElementById("greetingInput");
-    if (greetingInput) {
-      greetingInput.addEventListener("input", updateWordCount);
-    }
-
-    const greetingSaveBtn = document.getElementById("greetingSaveBtn");
-    if (greetingSaveBtn) {
-      greetingSaveBtn.addEventListener("click", saveGreeting);
-    }
-
-    const greetingCancel = document.getElementById("greetingCancel");
-    if (greetingCancel) {
-      greetingCancel.addEventListener("click", () => {
-        hideModal("greetingModal");
-        greetingInput.value = "";
-        updateWordCount();
-      });
-    }
-
-    // Close modals when clicking outside
-    document.addEventListener("click", (e) => {
-      if (e.target.classList.contains("modal")) {
-        e.target.classList.add("hidden");
-      }
-    });
-
-    // Initialize admin button state
-    updateAdminButton();
-  }
-=======
+  // -----------------------
+  // Document ready initialization
+  // -----------------------
   document.addEventListener("visibilitychange", () => {
     if (document.hidden && ws) stopListening();
   });
 
-  // -----------------------
-  // Init
-  // -----------------------
   document.addEventListener("DOMContentLoaded", () => {
     initGreetingModal();
     initCallNow();
