@@ -186,7 +186,8 @@
       throw new Error(`HTTP ${resp.status} posting ${path}`);
     }
     return resp.json();
-=======
+  }
+
   // -----------------------
   // Call-now button wiring
   // -----------------------
@@ -302,21 +303,6 @@
 
       // For small screens, preserve visible label near input as well (aria)
       input.setAttribute("aria-label", row.key);
-
-    if (callNowBtn) {
-      callNowBtn.addEventListener("click", async () => {
-        try {
-          callNowBtn.disabled = true;
-          await apiPost("/api/scamcalls/call-now");
-          setTimeout(() => { callNowBtn.disabled = false; }, 3000);
-        } catch (err) {
-          callNowBtn.disabled = false;
-          // Check if it's a rate limit error
-          if (err.rateLimit) {
-            showToast("Max calls reached in alloted time. Dont over scam the scammer!", "error");
-          } else {
-            alert("Failed to request a call. Please try again.");
-          }
 
       valWrapper.appendChild(input);
       tdVal.appendChild(valWrapper);
@@ -999,11 +985,6 @@
     if (btn) btn.textContent = "Listen live";
   }
 
-
-  const pageLive = isLivePage;
-  if (pageLive) initLivePage();
-  if (isHistoryPage) initHistoryPage();
-
   // ===============================
   // Admin and Modal Functionality
   // ===============================
@@ -1145,7 +1126,7 @@
     if (!input) return;
 
     try {
-      await apiPost("/api/scamcalls/next-greeting", { phrase: input.value.trim() });
+      await apiPost("/api/next-greeting", { phrase: input.value.trim() });
       hideModal("greetingModal");
       input.value = "";
       updateWordCount();
@@ -1156,10 +1137,9 @@
   }
 
   // Event listeners for admin functionality
-  if (pageLive) {
-    // Admin button
-    const adminBtn = document.getElementById("adminBtn");
-    if (adminBtn) {
+  // Admin button
+  const adminBtn = document.getElementById("adminBtn");
+  if (adminBtn) {
       adminBtn.addEventListener("click", () => {
         if (isAdminLoggedIn) {
           loadAdminConfig();
@@ -1259,8 +1239,7 @@
 
     // Initialize admin button state
     updateAdminButton();
-  }
-=======
+
   document.addEventListener("visibilitychange", () => {
     if (document.hidden && ws) stopListening();
   });
