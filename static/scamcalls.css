@@ -304,6 +304,16 @@ textarea#greetingInput {
   opacity: 1;
   transform: translateY(0);
 }
+.toast--error {
+  border-color: #ff6b6b;
+  background: rgba(255, 107, 107, 0.12);
+  color: #ffd5d5;
+}
+.toast--success {
+  border-color: #2ee6a6;
+  background: rgba(46, 230, 166, 0.12);
+  color: #d5ffed;
+}
 .alert {
   border: 1px solid var(--border);
   border-radius: 10px;
