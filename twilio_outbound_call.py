@@ -1513,6 +1513,17 @@ def _say_with_prosody(vr: VoiceResponse, text: str, voice: str, language: str) -
         vr.say(text, voice=voice, language=language)
 
 
+def _pop_one_shot_opening() -> Optional[str]:
+    """Pop and return a one-shot opening phrase if available.
+    
+    This is a stub implementation - in a full system this would 
+    interface with the greeting storage mechanism.
+    """
+    # For now, return None to use the default opening logic
+    # In a real system, this would check for stored greetings
+    return None
+
+
 def _build_opening_lines_for_sid(call_sid: str) -> List[str]:
     one = _pop_one_shot_opening()
     if one:

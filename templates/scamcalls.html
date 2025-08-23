@@ -1,76 +1,5 @@
 <!DOCTYPE html>
 <html lang="en">
-
-  <head>
-    <meta charset="utf-8" />
-    <title>Scam Call Monitor</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <link rel="icon" href="/static/favicon.ico" sizes="any" />
-    <style>
-      body { margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; background: #0b1820; color: #d4f1f9; }
-      header { display: flex; align-items: center; justify-content: space-between; padding: 16px 24px; border-bottom: 1px solid rgba(255,255,255,0.06); }
-      header .title { font-weight: 600; }
-      header nav a { color: #87f7cf; margin-left: 16px; text-decoration: none; }
-      main { padding: 24px; }
-      .panel { background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.07); border-radius: 12px; padding: 24px; }
-      .hidden { display: none; }
-      .status-dot { width: 10px; height: 10px; border-radius: 50%; background: #1a3; box-shadow: 0 0 8px #1a3; }
-      .status-dot.idle { background: #444; box-shadow: none; }
-      .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
-      .countdown { display: flex; align-items: center; gap: 24px; }
-      .ring { width: 200px; height: 200px; position: relative; }
-      .ring svg { transform: rotate(-90deg); }
-      .ring .label { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; flex-direction: column; color: #e8fffb; }
-      .ring .label .time { font-size: 44px; font-weight: 800; letter-spacing: 1px; }
-      .ring .label .sub { margin-top: 8px; opacity: 0.8; }
-      .meta { display: grid; grid-template-columns: auto auto; gap: 8px 12px; }
-      .button { padding: 10px 16px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.15); background: #0f2a29; color: #9ff3d7; cursor: pointer; }
-      .button.primary { background: #14b89a; color: #04221f; border: none; }
-      .button[disabled] { opacity: 0.6; cursor: not-allowed; }
-      .conversation { height: 420px; overflow: auto; background: rgba(0,0,0,0.2); border: 1px solid rgba(255,255,255,0.06); border-radius: 12px; padding: 16px; }
-      .message { display: grid; grid-template-columns: 120px 1fr; gap: 8px; padding: 6px 0; border-bottom: 1px dashed rgba(255,255,255,0.06); }
-      .message .role.assistant { color: #87f7cf; font-weight: 700; }
-      .message .role.callee { color: #d6c3ff; font-weight: 700; }
-      footer { margin-top: 16px; opacity: 0.7; font-size: 12px; }
-      .caps { font-variant-numeric: tabular-nums; }
-      .inline { display: inline-flex; align-items: center; gap: 8px; }
-      
-      /* Admin and Modal Styles */
-      .admin-btn { font-size: 12px; padding: 6px 12px; }
-      .admin-btn.logged-in { background: #14b89a; color: #04221f; }
-      
-      .modal { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.8); z-index: 1000; display: flex; align-items: center; justify-content: center; }
-      .modal.hidden { display: none; }
-      .modal-content { background: rgba(15, 22, 32, 0.95); border: 1px solid rgba(255,255,255,0.1); border-radius: 12px; padding: 24px; min-width: 300px; max-width: 500px; }
-      .modal-content h3 { margin: 0 0 16px 0; color: #87f7cf; }
-      
-      .form-group { margin-bottom: 16px; }
-      .form-group label { display: block; margin-bottom: 4px; font-size: 14px; color: #d8e1ea; }
-      .form-input { width: 100%; padding: 8px 12px; border: 1px solid rgba(255,255,255,0.15); border-radius: 6px; background: rgba(0,0,0,0.3); color: #d8e1ea; font-size: 14px; }
-      .form-input:focus { outline: none; border-color: #00e0a4; }
-      
-      .modal-actions { display: flex; gap: 8px; margin-top: 16px; }
-      .button.danger { background: #ff6b6b; color: white; }
-      
-      .error { color: #ff6b6b; font-size: 14px; margin-top: 8px; }
-      .success { color: #2ee6a6; font-size: 14px; margin-top: 8px; }
-      .word-count { font-size: 12px; color: #8aa1b2; margin-top: 4px; }
-      
-      /* Toast Notifications */
-      .toast-container { position: fixed; top: 20px; right: 20px; z-index: 2000; }
-      .toast { background: rgba(15, 22, 32, 0.95); border: 1px solid rgba(255,255,255,0.1); border-radius: 8px; padding: 12px 16px; margin-bottom: 8px; min-width: 250px; }
-      .toast.error { border-color: #ff6b6b; background: rgba(255, 107, 107, 0.1); }
-      .toast.success { border-color: #2ee6a6; background: rgba(46, 230, 166, 0.1); }
-      .toast-message { color: #d8e1ea; font-size: 14px; }
-    </style>
-  </head>
-  <body data-page="scamcalls">
-    <header>
-      <div class="title">Scam Call Monitor</div>
-      <nav>
-        <a href="/scamcalls" aria-current="page">Live</a>
-        <a href="/scamcalls/history">History</a>
-        <button id="adminBtn" class="button admin-btn" type="button">Admin</button>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
@@ -92,7 +21,6 @@
         {% else %}
           <a class="btn btn-secondary" href="/admin/login" id="btnAdminLogin" title="Administrator login">Admin</a>
         {% endif %}
-
       </nav>
     </header>
 
@@ -100,62 +28,61 @@
       <div class="controls-row" id="console-controls">
         <button id="btnCallNow" class="btn btn-primary" type="button" aria-label="Call now">Call now</button>
         <button id="btnAddGreeting" class="btn" type="button" aria-label="Add greeting phrase">Add greeting phrase</button>
-
-        <!-- Links to related pages (speech settings, caller messages) -->
-        <a class="btn btn-secondary" href="/scamcalls/speech" id="btnSpeechSettings" role="button" aria-label="Speech settings">Speech settings</a>
-        <a class="btn btn-secondary" href="/scamcalls/messages" id="btnMessages" role="button" aria-label="Caller messages">Caller messages</a>
       </div>
 
-      <!-- Metrics: total calls, total call time -->
       <div id="metricsArea" style="margin-top:0.8rem;"></div>
 
-        <div class="grid">
-          <!-- Countdown panel -->
-          <div id="countdownPanel">
+      <section class="grid" role="region" aria-labelledby="call-status">
+        <div class="panel">
+          <div class="panel-header" id="call-status">
             <div class="countdown">
               <div class="ring">
-                <svg viewBox="0 0 120 120" width="200" height="200" aria-hidden="true">
-                  <circle cx="60" cy="60" r="54" stroke="rgba(255,255,255,0.08)" stroke-width="12" fill="none"></circle>
-                  <circle class="ring-progress" cx="60" cy="60" r="54" stroke="#1ef7c5" stroke-width="12" fill="none" stroke-linecap="round"></circle>
+                <svg width="200" height="200">
+                  <circle cx="100" cy="100" r="96" fill="none" stroke="rgba(255,255,255,0.1)" stroke-width="2"/>
+                  <circle id="progressCircle" cx="100" cy="100" r="96" fill="none" stroke="#14b89a" stroke-width="4" stroke-linecap="round" stroke-dasharray="603" stroke-dashoffset="603"/>
                 </svg>
                 <div class="label">
                   <div class="time"><span id="cdMinutes">--</span>:<span id="cdSeconds">--</span></div>
                   <div class="sub" id="cdSubtitle">Until next call attempt</div>
                 </div>
               </div>
-              <div style="display:flex; flex-direction:column; gap:8px;">
-                <button id="callNowBtn" class="button primary" type="button">Call now</button>
-                <button id="addGreetingBtn" class="button" type="button">Add greeting phrase</button>
+              <div style="flex-grow: 1;">
+                <div style="color: #87f7cf; font-weight: 700; margin-bottom: 4px;">Call Status</div>
                 <div style="font-size: 12px; opacity: 0.8;">Served via: <span id="publicUrl">auto</span></div>
               </div>
             </div>
           </div>
+        </div>
+      </section>
 
       <div id="statusArea" class="status-area" aria-live="polite" aria-atomic="true"></div>
 
+      <section id="livePanel" class="panel">
+        <h2>Live Conversation</h2>
+        <div id="transcript" class="conversation" role="log" aria-live="polite" aria-label="Live conversation transcript"></div>
+        <div class="live-actions">
+          <button id="btnToggleAudio" class="btn" type="button" aria-label="Toggle audio listening" disabled>Listen live</button>
+        </div>
+      </section>
 
       {% if is_admin %}
-      <hr />
-      <section id="adminPanel" class="admin-panel" aria-labelledby="admin-panel-title">
-        <div class="admin-panel__header">
-          <h2 id="admin-panel-title">Admin Settings</h2>
-          <p class="muted">
-            Update non-secret configuration values. Values are loaded from the server and persisted back to .env.
-          </p>
-        </div>
-        <!-- envEditor is rendered by JS as a responsive table on desktop and stacked cards on mobile -->
-        <div id="envEditor" class="env-editor" data-endpoint-get="/api/admin/env" data-endpoint-post="/api/admin/env" aria-busy="true" aria-live="polite">
-          <div class="skeleton-row" aria-hidden="true"></div>
-          <div class="skeleton-row" aria-hidden="true"></div>
-          <div class="skeleton-row" aria-hidden="true"></div>
-        </div>
-        <div class="form-actions">
-          <button id="btnSaveEnv" class="btn btn-primary" type="button" disabled>Save settings</button>
+      <section class="panel admin-panel">
+        <h2>Admin Environment Settings</h2>
+        <div class="env-container">
+          <div id="envEditor" data-endpoint-get="/api/admin/config" data-endpoint-post="/api/admin/config" aria-live="polite">
+            <div class="skeleton-row" aria-hidden="true"></div>
+            <div class="skeleton-row" aria-hidden="true"></div>
+            <div class="skeleton-row" aria-hidden="true"></div>
+          </div>
+          <div class="form-actions">
+            <button id="btnSaveEnv" class="btn btn-primary" type="button" disabled>Save settings</button>
+          </div>
         </div>
       </section>
       {% endif %}
     </section>
 
+    <!-- Greeting Modal -->
     <div id="greetingModal" class="modal" aria-hidden="true" role="dialog" aria-modal="true" aria-labelledby="greetingModalTitle">
       <div class="modal__dialog" role="document">
         <div class="modal__header">
@@ -177,73 +104,11 @@
     <div id="toast" class="toast" role="status" aria-live="polite" aria-atomic="true"></div>
   </main>
 
-
-    <!-- Admin Login Modal -->
-    <div id="adminLoginModal" class="modal hidden">
-      <div class="modal-content">
-        <h3>Admin Login</h3>
-        <div class="form-group">
-          <label for="adminUsername">Username:</label>
-          <input type="text" id="adminUsername" class="form-input" placeholder="Username" />
-        </div>
-        <div class="form-group">
-          <label for="adminPassword">Password:</label>
-          <input type="password" id="adminPassword" class="form-input" placeholder="Password" />
-        </div>
-        <div class="modal-actions">
-          <button id="adminLoginBtn" class="button primary" type="button">Login</button>
-          <button id="adminLoginCancel" class="button" type="button">Cancel</button>
-        </div>
-        <div id="adminLoginError" class="error hidden"></div>
-      </div>
-    </div>
-
-    <!-- Admin Settings Modal -->
-    <div id="adminSettingsModal" class="modal hidden">
-      <div class="modal-content">
-        <h3>Admin Settings</h3>
-        <div id="configForm">
-          <!-- Config fields will be populated dynamically -->
-        </div>
-        <div class="modal-actions">
-          <button id="adminSaveBtn" class="button primary" type="button">Save</button>
-          <button id="adminLogoutBtn" class="button danger" type="button">Logout</button>
-          <button id="adminSettingsCancel" class="button" type="button">Close</button>
-        </div>
-        <div id="adminSettingsError" class="error hidden"></div>
-        <div id="adminSettingsSuccess" class="success hidden"></div>
-      </div>
-    </div>
-
-    <!-- Greeting Phrase Modal -->
-    <div id="greetingModal" class="modal hidden">
-      <div class="modal-content">
-        <h3>Add Greeting Phrase</h3>
-        <div class="form-group">
-          <label for="greetingInput">Greeting phrase (5-15 words):</label>
-          <textarea id="greetingInput" class="form-input" placeholder="Enter greeting phrase..." rows="3"></textarea>
-          <div class="word-count">Words: <span id="wordCount">0</span>/15</div>
-        </div>
-        <div class="modal-actions">
-          <button id="greetingSaveBtn" class="button primary" type="button">Save Greeting</button>
-          <button id="greetingCancel" class="button" type="button">Cancel</button>
-        </div>
-        <div id="greetingError" class="error hidden"></div>
-        <div id="greetingSuccess" class="success hidden"></div>
-      </div>
-    </div>
-
-    <!-- Toast notifications -->
-    <div id="toastContainer" class="toast-container"></div>
-
-    <script src="/static/matrix.js"></script>
-    <script src="/static/scamcalls.js"></script>
-    <link rel="stylesheet" href="/static/matrix.css">
-  </body>
+  <!-- Toast notifications -->
+  <div id="toastContainer" class="toast-container"></div>
 
   <script src="/static/js/matrix-rain.js"></script>
   <script src="/static/scamcalls.js"></script>
   <script src="/static/js/theme-enhance.js"></script>
 </body>
-
 </html>

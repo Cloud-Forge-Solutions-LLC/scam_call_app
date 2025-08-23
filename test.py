@@ -836,11 +836,7 @@ def next_opening():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 400
 
-# Global variable for greeting phrase storage
-NEXT_GREETING_PHRASE = None
-NEXT_GREETING_LOCK = threading.Lock()
-
-@app.route("/api/scamcalls/next-greeting", methods=["POST"])
+@app.route("/api/next-greeting", methods=["POST"])
 def next_greeting():
     """Set a greeting phrase for the next call"""
     try:
@@ -863,9 +859,9 @@ def next_greeting():
             return jsonify({"ok": False, "error": "Phrase contained disallowed content"}), 400
         
         # Store for one-time use
-        with NEXT_GREETING_LOCK:
-            global NEXT_GREETING_PHRASE
-            NEXT_GREETING_PHRASE = safe
+        with ONE_SHOT_OPENING_LOCK:
+            global ONE_SHOT_OPENING
+            ONE_SHOT_OPENING = safe
         
         return jsonify({"ok": True})
     except Exception as e:
